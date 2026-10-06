@@ -58,7 +58,7 @@
       <div class="bg-slate-800/60 rounded-xl p-3">
         <h2 class="text-sm font-semibold mb-1">族群資金佔比</h2>
         <p class="text-[11px] text-slate-500 mb-2">個股可屬多個族群，佔比加總可能超過 100%；圓環為相對比例。</p>
-        <div class="relative h-72"><canvas id="pie"></canvas></div>
+        <div id="pieWrap" class="relative h-72"><canvas id="pie"></canvas></div>
       </div>
       <div class="bg-slate-800/60 rounded-xl p-3">
         <h2 class="text-sm font-semibold mb-1">當日漲幅 vs 5 日漲幅</h2>
@@ -90,7 +90,15 @@
 /* ===== 設定 =====
  * 預設載入的資料網址（相對於 index.html）。載入失敗時自動使用下方示範資料。
  * 若 Python 腳本另存一份固定檔名（如 stocks_latest.csv），就能每天自動更新。 */
-const CONFIG = { DEFAULT_URLS: ["output/stocks_latest.csv", "output/sectors_latest.csv"] };
+const CONFIG = {
+  DEFAULT_URLS: ["output/stocks_latest.csv", "output/sectors_latest.csv"],
+  CHART_SITE: "histock"   // 點個股名稱開啟的 K 線圖網站：histock 或 goodinfo
+};
+const CHART_SITES = {
+  histock:  c => `https://histock.tw/stock/tcharti.aspx?no=${c}`,
+  goodinfo: c => `https://goodinfo.tw/tw/ShowK_Chart.asp?STOCK_ID=${c}`
+};
+const chartUrl = c => CHART_SITES[CONFIG.CHART_SITE](encodeURIComponent(c));
 
 /* ===== JSON 資料結構（與 Python 產出欄位一一對應）=====
  * {
@@ -100,6 +108,7 @@ const CONFIG = { DEFAULT_URLS: ["output/stocks_latest.csv", "output/sectors_late
  * }
  * CSV 欄位：stocks_*.csv → 族群,代號,名稱,產業分類,說明,日期,收盤價,當日漲跌幅(%),近5日漲跌幅(%),成交金額(億),成交金額(元)
  *          （每檔個股依所屬族群各列一次；舊格式「所屬族群」欄位仍可讀取）
+ * 點個股名稱會開啟 K 線圖（網站可在上方 CONFIG.CHART_SITE 切換）。
  *          sectors_*.csv → 族群,有效檔數,設定檔數,當日平均漲幅(%),當日加權漲幅(%),近5日平均漲幅(%),成交金額(億),資金占比(%) */
 const SAMPLE = { date: "示範", stocks: [
   {code:"2330",name:"台積電",close:1050,pct1d:1.25,pct5d:3.10,turnoverYi:520.3,sectors:["半導體"]},
@@ -199,12 +208,13 @@ function showMsg(t) { $("msg").textContent = t; $("msg").classList.toggle("hidde
 
 /* ===== 繪圖 ===== */
 Chart.defaults.color = "#94a3b8"; Chart.defaults.borderColor = "rgba(148,163,184,.15)";
-const PAL = ["#38bdf8","#a78bfa","#fbbf24","#2dd4bf","#f472b6","#818cf8","#fb923c","#a3e635","#22d3ee","#e879f9"];
+const PAL = ["#38bdf8","#a78bfa","#fbbf24","#2dd4bf","#f472b6","#818cf8","#fb923c","#a3e635","#22d3ee","#e879f9","#facc15","#34d399","#60a5fa","#c084fc","#f9a8d4","#5eead4","#fdba74","#bef264"];
 let pieC, barC;
 const v1 = s => S.weighted ? s.wavg1d : s.avg1d;
 
 function renderCharts() {
   const sec = [...S.data.sectors].sort((a, b) => b.turnoverYi - a.turnoverYi);
+  $("pieWrap").style.height = (300 + Math.ceil(sec.length / 2) * 22) + "px";
   pieC?.destroy();
   pieC = new Chart($("pie"), { type:"doughnut",
     data:{ labels: sec.map(s => s.name), datasets:[{ data: sec.map(s => s.share), backgroundColor: sec.map((_, i) => PAL[i % PAL.length]), borderWidth:0 }] },
@@ -214,7 +224,7 @@ function renderCharts() {
       onClick:(e, els) => { if (els.length) pick(sec[els[0].index].name); } } });
 
   const bs = [...S.data.sectors].sort((a, b) => v1(b) - v1(a));
-  $("barWrap").style.height = Math.max(288, bs.length * 56 + 60) + "px";
+  $("barWrap").style.height = Math.max(288, bs.length * 40 + 80) + "px";
   const colorOf = a => c => (c.raw >= 0 ? RED(a) : GREEN(a));
   barC?.destroy();
   barC = new Chart($("bar"), { type:"bar",
@@ -261,7 +271,7 @@ function renderStocks() {
       return (x > y ? 1 : x < y ? -1 : 0) * dir;
     });
   $("tbody").innerHTML = rows.map(s => `<tr class="hover:bg-slate-700/30">
-    <td class="sticky-col px-3 py-2 whitespace-nowrap"><span class="num text-slate-400">${esc(s.code)}</span> <span class="font-medium">${esc(s.name)}</span></td>
+    <td class="sticky-col px-3 py-2 whitespace-nowrap"><span class="num text-slate-400">${esc(s.code)}</span> <a href="${chartUrl(s.code)}" target="_blank" rel="noopener noreferrer" title="開啟 ${esc(s.name)} K 線圖" class="font-medium text-sky-300 hover:underline">${esc(s.name)}</a></td>
     <td class="px-3 py-2 whitespace-nowrap text-sky-300">${esc(s.segment || "-")}</td>
     <td class="px-3 py-2 text-xs text-slate-300 min-w-[11rem]">${esc(s.desc || "-")}</td>
     <td class="num text-right px-3 py-2">${s.close.toFixed(2)}</td>
