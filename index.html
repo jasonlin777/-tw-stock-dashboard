@@ -72,8 +72,9 @@
   <!-- 個股明細 -->
   <section id="stocks" class="space-y-3 hidden">
     <div id="chips" class="flex gap-2 overflow-x-auto pb-1"></div>
+    <p id="allNote" class="text-[11px] text-slate-500">「全部」檢視中，同一檔股票會依所屬族群各列一次（各族群的產業分類與說明不同）。</p>
     <div class="bg-slate-800/60 rounded-xl overflow-x-auto">
-      <table class="w-full min-w-[680px] text-sm">
+      <table class="w-full min-w-[980px] text-sm">
         <thead class="text-slate-400 text-xs">
           <tr id="thead"></tr>
         </thead>
@@ -94,10 +95,11 @@ const CONFIG = { DEFAULT_URLS: ["output/stocks_latest.csv", "output/sectors_late
 /* ===== JSON 資料結構（與 Python 產出欄位一一對應）=====
  * {
  *   "date": "2026-10-06",
- *   "stocks": [{ code, name, close, pct1d, pct5d, turnoverYi, sectors: ["族群A", ...] }],
+ *   "stocks": [{ code, name, segment, desc, close, pct1d, pct5d, turnoverYi, sectors: ["族群A", ...] }],  // segment=產業分類, desc=說明
  *   "sectors": [{ name, count, avg1d, wavg1d, avg5d, turnoverYi, share }]   // 選填；缺少時由個股自動計算
  * }
- * CSV 欄位：stocks_*.csv → 代號,名稱,日期,收盤價,當日漲跌幅(%),近5日漲跌幅(%),成交金額(元),成交金額(億),所屬族群
+ * CSV 欄位：stocks_*.csv → 族群,代號,名稱,產業分類,說明,日期,收盤價,當日漲跌幅(%),近5日漲跌幅(%),成交金額(億),成交金額(元)
+ *          （每檔個股依所屬族群各列一次；舊格式「所屬族群」欄位仍可讀取）
  *          sectors_*.csv → 族群,有效檔數,設定檔數,當日平均漲幅(%),當日加權漲幅(%),近5日平均漲幅(%),成交金額(億),資金占比(%) */
 const SAMPLE = { date: "示範", stocks: [
   {code:"2330",name:"台積電",close:1050,pct1d:1.25,pct5d:3.10,turnoverYi:520.3,sectors:["半導體"]},
@@ -147,10 +149,12 @@ const num = v => parseFloat(String(v).replace(/,/g, "")) || 0;
 const findKey = (o, re) => Object.keys(o).find(k => re.test(k));
 function normStock(r) {
   const k5 = findKey(r, /^近\d+日漲跌幅/);
+  const secs = r["族群"] ? [r["族群"]] : (r["所屬族群"] || "").split(/[、,]/).map(s => s.trim()).filter(Boolean);
   return { code: r["代號"], name: r["名稱"], date: r["日期"], close: num(r["收盤價"]),
+    segment: r["產業分類"] || "", desc: r["說明"] || "",
     pct1d: num(r["當日漲跌幅(%)"]), pct5d: num(r[k5]),
     turnoverYi: r["成交金額(億)"] !== undefined ? num(r["成交金額(億)"]) : num(r["成交金額(元)"]) / 1e8,
-    sectors: (r["所屬族群"] || "").split(/[、,]/).map(s => s.trim()).filter(Boolean) };
+    sectors: secs };
 }
 function normSector(r) {
   const k5 = findKey(r, /^近\d+日平均漲幅/);
@@ -160,7 +164,8 @@ function normSector(r) {
 
 /* 若沒有族群檔，直接由個股計算（邏輯同 Python 腳本）*/
 function computeSectors(stocks) {
-  const total = stocks.reduce((a, s) => a + s.turnoverYi, 0) || 1;
+  const uniq = {}; stocks.forEach(s => uniq[s.code] = s.turnoverYi);
+  const total = Object.values(uniq).reduce((a, b) => a + b, 0) || 1;
   const m = {};
   stocks.forEach(s => s.sectors.forEach(n => (m[n] ||= []).push(s)));
   return Object.entries(m).map(([name, g]) => {
@@ -241,11 +246,13 @@ function renderCards() {
     </button>`).join("");
 }
 
-const COLS = [["name","代號／名稱"],["close","收盤價"],["pct1d","當日漲跌"],["pct5d","5日漲跌"],["turnoverYi","成交金額"],["sectors","所屬族群"]];
+const COLS = [["name","代號／名稱"],["segment","產業分類"],["desc","說明"],["close","收盤價"],["pct1d","當日漲跌"],["pct5d","5日漲跌"],["turnoverYi","成交金額"],["sectors","族群"]];
+const LEFT = ["name","segment","desc","sectors"];
 function renderStocks() {
   const names = S.data.sectors.map(s => s.name);
   $("chips").innerHTML = [null, ...names].map(n => `<button data-chip="${n === null ? "" : esc(n)}" class="chip shrink-0 px-3 py-1 rounded-full text-sm ${S.filter === n ? "bg-sky-600" : "bg-slate-800 hover:bg-slate-700"}">${n === null ? "全部" : esc(n)}</button>`).join("");
-  $("thead").innerHTML = COLS.map(([k, t], i) => `<th data-sort="${k}" class="sortable ${i === 0 ? "sticky-col text-left" : "text-right"} px-3 py-2 font-medium whitespace-nowrap">${t}${S.sort.key === k ? (S.sort.dir > 0 ? " ▲" : " ▼") : ""}</th>`).join("");
+  $("allNote").classList.toggle("hidden", !!S.filter);
+  $("thead").innerHTML = COLS.map(([k, t], i) => `<th data-sort="${k}" class="sortable ${i === 0 ? "sticky-col text-left" : LEFT.includes(k) ? "text-left" : "text-right"} px-3 py-2 font-medium whitespace-nowrap">${t}${S.sort.key === k ? (S.sort.dir > 0 ? " ▲" : " ▼") : ""}</th>`).join("");
   const {key, dir} = S.sort;
   const rows = S.data.stocks.filter(s => !S.filter || s.sectors.includes(S.filter))
     .sort((a, b) => {
@@ -255,12 +262,14 @@ function renderStocks() {
     });
   $("tbody").innerHTML = rows.map(s => `<tr class="hover:bg-slate-700/30">
     <td class="sticky-col px-3 py-2 whitespace-nowrap"><span class="num text-slate-400">${esc(s.code)}</span> <span class="font-medium">${esc(s.name)}</span></td>
+    <td class="px-3 py-2 whitespace-nowrap text-sky-300">${esc(s.segment || "-")}</td>
+    <td class="px-3 py-2 text-xs text-slate-300 min-w-[11rem]">${esc(s.desc || "-")}</td>
     <td class="num text-right px-3 py-2">${s.close.toFixed(2)}</td>
     <td class="num text-right px-3 py-2 ${col(s.pct1d)}">${pct(s.pct1d)}</td>
     <td class="num text-right px-3 py-2 ${col(s.pct5d)}">${pct(s.pct5d)}</td>
     <td class="num text-right px-3 py-2 whitespace-nowrap">${yi(s.turnoverYi)}</td>
-    <td class="text-right px-3 py-2 text-xs text-slate-400 whitespace-nowrap">${s.sectors.map(esc).join("、")}</td></tr>`).join("")
-    || `<tr><td colspan="6" class="px-3 py-6 text-center text-slate-500">沒有資料</td></tr>`;
+    <td class="text-left px-3 py-2 text-xs text-slate-400 whitespace-nowrap">${s.sectors.map(esc).join("、")}</td></tr>`).join("")
+    || `<tr><td colspan="8" class="px-3 py-6 text-center text-slate-500">沒有資料</td></tr>`;
 }
 
 function render() {
