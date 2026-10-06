@@ -72,6 +72,11 @@
   <!-- 個股明細 -->
   <section id="stocks" class="space-y-3 hidden">
     <div id="chips" class="flex gap-2 overflow-x-auto pb-1"></div>
+    <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+      <label for="chartSel">點名稱開啟 K 線圖：</label>
+      <select id="chartSel" class="bg-slate-800 rounded-md px-2 py-1 text-slate-200 outline-none"></select>
+      <span class="text-slate-500">（打不開或沒有圖時，換一個網站試試）</span>
+    </div>
     <p id="allNote" class="text-[11px] text-slate-500">「全部」檢視中，同一檔股票會依所屬族群各列一次（各族群的產業分類與說明不同）。</p>
     <div class="bg-slate-800/60 rounded-xl overflow-x-auto">
       <table class="w-full min-w-[980px] text-sm">
@@ -92,13 +97,15 @@
  * 若 Python 腳本另存一份固定檔名（如 stocks_latest.csv），就能每天自動更新。 */
 const CONFIG = {
   DEFAULT_URLS: ["output/stocks_latest.csv", "output/sectors_latest.csv"],
-  CHART_SITE: "histock"   // 點個股名稱開啟的 K 線圖網站：histock 或 goodinfo
+  CHART_SITE: "goodinfo"   // 預設的 K 線圖網站；也可在「個股明細」頁用下拉選單切換（會記住選擇）
 };
+/* 點個股名稱開啟的 K 線圖網站（皆以台股代號查詢，上市／上櫃通用） */
 const CHART_SITES = {
-  histock:  c => `https://histock.tw/stock/tcharti.aspx?no=${c}`,
-  goodinfo: c => `https://goodinfo.tw/tw/ShowK_Chart.asp?STOCK_ID=${c}`
+  goodinfo:  { label: "Goodinfo 台灣股市資訊網", url: c => `https://goodinfo.tw/tw/ShowK_Chart.asp?STOCK_ID=${c}` },
+  wantgoo:   { label: "玩股網 WantGoo",           url: c => `https://www.wantgoo.com/stock/${c}/technical-chart` },
+  moneylink: { label: "MoneyLink 鉅亨",           url: c => `https://ww2.money-link.com.tw/TWStock/StockTA.aspx?SymId=${c}` }
 };
-const chartUrl = c => CHART_SITES[CONFIG.CHART_SITE](encodeURIComponent(c));
+const chartUrl = c => CHART_SITES[S.chartSite].url(encodeURIComponent(c));
 
 /* ===== JSON 資料結構（與 Python 產出欄位一一對應）=====
  * {
@@ -108,7 +115,7 @@ const chartUrl = c => CHART_SITES[CONFIG.CHART_SITE](encodeURIComponent(c));
  * }
  * CSV 欄位：stocks_*.csv → 族群,代號,名稱,產業分類,說明,日期,收盤價,當日漲跌幅(%),近5日漲跌幅(%),成交金額(億),成交金額(元)
  *          （每檔個股依所屬族群各列一次；舊格式「所屬族群」欄位仍可讀取）
- * 點個股名稱會開啟 K 線圖（網站可在上方 CONFIG.CHART_SITE 切換）。
+ * 點個股名稱會開啟 K 線圖（網站可用「個股明細」頁的下拉選單切換）。
  *          sectors_*.csv → 族群,有效檔數,設定檔數,當日平均漲幅(%),當日加權漲幅(%),近5日平均漲幅(%),成交金額(億),資金占比(%) */
 const SAMPLE = { date: "示範", stocks: [
   {code:"2330",name:"台積電",close:1050,pct1d:1.25,pct5d:3.10,turnoverYi:520.3,sectors:["半導體"]},
@@ -126,7 +133,10 @@ const SAMPLE = { date: "示範", stocks: [
 ]};
 
 /* ===== 狀態 ===== */
-const S = { data:null, sample:false, view:"overview", filter:null, weighted:false, sort:{key:"pct1d",dir:-1} };
+let savedSite = null;
+try { savedSite = localStorage.getItem("chartSite"); } catch (e) {}
+const S = { data:null, sample:false, view:"overview", filter:null, weighted:false, sort:{key:"pct1d",dir:-1},
+  chartSite: CHART_SITES[savedSite] ? savedSite : CONFIG.CHART_SITE };
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
@@ -312,6 +322,14 @@ $("loadUrl").onclick = async () => {
   const urls = $("urls").value.split(/[\s,]+/).filter(Boolean); if (!urls.length) return;
   try { ingest(await fetchTexts(urls)); showMsg(""); render(); }
   catch (err) { showMsg("載入失敗：" + err.message + "（若為跨網域請求，來源需允許 CORS）"); }
+};
+
+$("chartSel").innerHTML = Object.entries(CHART_SITES).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join("");
+$("chartSel").value = S.chartSite;
+$("chartSel").onchange = e => {
+  S.chartSite = e.target.value;
+  try { localStorage.setItem("chartSite", S.chartSite); } catch (err) {}
+  renderStocks();
 };
 
 /* ===== 啟動：先嘗試預設網址，失敗則顯示示範資料 ===== */
