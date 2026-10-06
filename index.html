@@ -11,6 +11,8 @@
   .num{font-variant-numeric:tabular-nums}
   th.sortable{cursor:pointer;user-select:none}
   .sticky-col{position:sticky;left:0;background:#0f172a;z-index:1}
+  tr.hl td{background:rgba(14,165,233,.18)}
+  tr.hl td.sticky-col{background:#0b3a56}
 </style>
 </head>
 <body class="text-slate-200 min-h-screen">
@@ -31,6 +33,15 @@
       <button id="toggleUrl" class="px-3 py-1.5 text-sm rounded-lg bg-slate-700 hover:bg-slate-600">網址載入</button>
     </div>
   </header>
+
+  <!-- 搜尋：輸入股票代號（或名稱），自動跳到該股所屬概念股清單 -->
+  <div>
+    <input id="q" list="stockList" inputmode="search" autocomplete="off" enterkeyhint="search"
+      placeholder="🔍 輸入股票代號，自動跳到概念股頁面（例如 2330）"
+      class="w-full bg-slate-800 rounded-xl px-4 py-2.5 text-sm outline-none focus:ring-2 focus:ring-sky-500">
+    <datalist id="stockList"></datalist>
+    <p id="qMsg" class="hidden mt-1 text-sm text-amber-300"></p>
+  </div>
 
   <div id="urlBox" class="hidden bg-slate-800/60 rounded-xl p-3 space-y-2">
     <p class="text-xs text-slate-400">貼上 CSV 或 JSON 網址（可多個，以空白或換行分隔；個股 CSV 與族群 CSV 可一起載入）</p>
@@ -71,6 +82,7 @@
 
   <!-- 個股明細 -->
   <section id="stocks" class="space-y-3 hidden">
+    <div id="hit" class="hidden flex flex-wrap items-center gap-2 rounded-xl bg-sky-500/10 px-3 py-2 text-sm"></div>
     <div id="chips" class="flex gap-2 overflow-x-auto pb-1"></div>
     <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400">
       <label for="chartSel">點名稱開啟 K 線圖：</label>
@@ -135,7 +147,7 @@ const SAMPLE = { date: "示範", stocks: [
 /* ===== 狀態 ===== */
 let savedSite = null;
 try { savedSite = localStorage.getItem("chartSite"); } catch (e) {}
-const S = { data:null, sample:false, view:"overview", filter:null, weighted:false, sort:{key:"pct1d",dir:-1},
+const S = { data:null, sample:false, view:"overview", filter:null, weighted:false, highlight:null, scrollToHit:false, listFor:null, sort:{key:"pct1d",dir:-1},
   chartSite: CHART_SITES[savedSite] ? savedSite : CONFIG.CHART_SITE };
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -269,6 +281,14 @@ function renderCards() {
 const COLS = [["name","代號／名稱"],["segment","產業分類"],["desc","說明"],["close","收盤價"],["pct1d","當日漲跌"],["pct5d","5日漲跌"],["turnoverYi","成交金額"],["sectors","族群"]];
 const LEFT = ["name","segment","desc","sectors"];
 function renderStocks() {
+  const hitRows = S.highlight ? S.data.stocks.filter(s => s.code === S.highlight) : [];
+  if (hitRows.length) {
+    const secs = [...new Set(hitRows.flatMap(s => s.sectors))];
+    $("hit").innerHTML = `<span class="font-semibold">${esc(hitRows[0].name)}（${esc(S.highlight)}）</span><span class="text-slate-400">屬於 ${secs.length} 個族群：</span>`
+      + secs.map(n => `<button data-chip="${esc(n)}" class="px-2.5 py-0.5 rounded-full text-xs ${S.filter === n ? "bg-sky-600" : "bg-slate-700 hover:bg-slate-600"}">${esc(n)}</button>`).join("")
+      + `<button data-clear="1" class="ml-auto px-2 text-slate-400 hover:text-slate-200" title="清除搜尋">✕</button>`;
+    $("hit").classList.remove("hidden");
+  } else $("hit").classList.add("hidden");
   const names = S.data.sectors.map(s => s.name);
   $("chips").innerHTML = [null, ...names].map(n => `<button data-chip="${n === null ? "" : esc(n)}" class="chip shrink-0 px-3 py-1 rounded-full text-sm ${S.filter === n ? "bg-sky-600" : "bg-slate-800 hover:bg-slate-700"}">${n === null ? "全部" : esc(n)}</button>`).join("");
   $("allNote").classList.toggle("hidden", !!S.filter);
@@ -280,7 +300,7 @@ function renderStocks() {
       const y = key === "sectors" ? b.sectors.join() : b[key === "name" ? "code" : key];
       return (x > y ? 1 : x < y ? -1 : 0) * dir;
     });
-  $("tbody").innerHTML = rows.map(s => `<tr class="hover:bg-slate-700/30">
+  $("tbody").innerHTML = rows.map(s => `<tr class="hover:bg-slate-700/30${s.code === S.highlight ? " hl" : ""}">
     <td class="sticky-col px-3 py-2 whitespace-nowrap"><span class="num text-slate-400">${esc(s.code)}</span> <a href="${chartUrl(s.code)}" target="_blank" rel="noopener noreferrer" title="開啟 ${esc(s.name)} K 線圖" class="font-medium text-sky-300 hover:underline">${esc(s.name)}</a></td>
     <td class="px-3 py-2 whitespace-nowrap text-sky-300">${esc(s.segment || "-")}</td>
     <td class="px-3 py-2 text-xs text-slate-300 min-w-[11rem]">${esc(s.desc || "-")}</td>
@@ -300,16 +320,26 @@ function render() {
   $("overview").classList.toggle("hidden", S.view !== "overview");
   $("stocks").classList.toggle("hidden", S.view !== "stocks");
   renderCards(); renderStocks(); renderCharts();
+  if (S.listFor !== S.data) {   // 資料更新時重建「代號＋名稱」建議清單
+    const seen = new Map(); S.data.stocks.forEach(x => seen.set(x.code, x.name));
+    $("stockList").innerHTML = [...seen].map(([c, n]) => `<option value="${esc(c)} ${esc(n)}">`).join("");
+    S.listFor = S.data;
+  }
+  if (S.scrollToHit) {
+    S.scrollToHit = false;
+    document.querySelector("tr.hl")?.scrollIntoView({ block:"center", behavior:"smooth" });
+  }
 }
-function pick(name) { S.filter = name || null; S.view = "stocks"; render(); window.scrollTo({top:0, behavior:"smooth"}); }
+function pick(name) { S.filter = name || null; S.highlight = null; $("q").value = ""; S.view = "stocks"; render(); window.scrollTo({top:0, behavior:"smooth"}); }
 
 /* ===== 事件 ===== */
 document.addEventListener("click", e => {
-  const t = e.target.closest("[data-view],[data-w],[data-sector],[data-chip],[data-sort]"); if (!t) return;
+  const t = e.target.closest("[data-view],[data-w],[data-sector],[data-chip],[data-sort],[data-clear]"); if (!t) return;
   if (t.dataset.view) { S.view = t.dataset.view; render(); }
   else if (t.dataset.w) { S.weighted = t.dataset.w === "1"; render(); }
   else if (t.dataset.sector) pick(t.dataset.sector);
-  else if (t.dataset.chip !== undefined) { S.filter = t.dataset.chip || null; render(); }
+  else if (t.dataset.chip !== undefined) { S.filter = t.dataset.chip || null; S.scrollToHit = !!S.highlight; render(); }
+  else if (t.dataset.clear) { S.highlight = null; $("q").value = ""; render(); }
   else if (t.dataset.sort) { const k = t.dataset.sort; S.sort = { key:k, dir: S.sort.key === k ? -S.sort.dir : -1 }; renderStocks(); }
 });
 $("toggleUrl").onclick = () => $("urlBox").classList.toggle("hidden");
@@ -323,6 +353,34 @@ $("loadUrl").onclick = async () => {
   try { ingest(await fetchTexts(urls)); showMsg(""); render(); }
   catch (err) { showMsg("載入失敗：" + err.message + "（若為跨網域請求，來源需允許 CORS）"); }
 };
+
+/* ===== 搜尋：代號（4～6 碼）或名稱 → 跳到所屬概念股清單並標示該股 ===== */
+function findStocks(v) {
+  const m = v.match(/^(\d{4,6})/);
+  if (m) return S.data.stocks.filter(x => x.code === m[1]);
+  const q = v.toLowerCase();
+  const exact = S.data.stocks.filter(x => x.name.toLowerCase() === q);
+  if (exact.length) return exact;
+  const part = S.data.stocks.filter(x => x.name.toLowerCase().includes(q));
+  return new Set(part.map(x => x.code)).size === 1 ? part : [];   // 名稱片段僅在唯一符合時才自動跳轉
+}
+function goStock(v, final) {
+  v = v.trim();
+  $("qMsg").classList.add("hidden");
+  if (!v || !S.data) return;
+  const hit = findStocks(v);
+  if (!hit.length) {
+    if (final || /^\d{4,6}$/.test(v)) { $("qMsg").textContent = `找不到「${v}」，可能不在追蹤清單內`; $("qMsg").classList.remove("hidden"); }
+    return;
+  }
+  const secs = [...new Set(hit.flatMap(x => x.sectors))];
+  S.highlight = hit[0].code; S.view = "stocks";
+  if (!S.filter || !secs.includes(S.filter)) S.filter = secs[0];   // 已在該股所屬族群內就維持不變
+  S.scrollToHit = true; render();
+}
+$("q").addEventListener("input", e => goStock(e.target.value, false));
+$("q").addEventListener("change", e => goStock(e.target.value, true));
+$("q").addEventListener("keydown", e => { if (e.key === "Enter") { goStock(e.target.value, true); e.target.blur(); } });
 
 $("chartSel").innerHTML = Object.entries(CHART_SITES).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join("");
 $("chartSel").value = S.chartSite;
