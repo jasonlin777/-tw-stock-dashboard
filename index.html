@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-Hant" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>台股族群資金流向儀表板</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body{background:#0b1220}
+  .num{font-variant-numeric:tabular-nums}
+  th.sortable{cursor:pointer;user-select:none}
+  .sticky-col{position:sticky;left:0;background:#0f172a;z-index:1}
+</style>
+</head>
+<body class="text-slate-200 min-h-screen">
+<div class="max-w-6xl mx-auto px-3 sm:px-6 py-4 space-y-4">
+
+  <!-- 標題與資料來源 -->
+  <header class="flex flex-wrap items-center justify-between gap-2">
+    <div>
+      <h1 class="text-lg sm:text-2xl font-bold">台股族群資金流向</h1>
+      <p class="text-xs text-slate-400">資料日期：<span id="date" class="num">-</span>
+        <span id="badge" class="ml-2 px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 hidden">示範資料</span></p>
+    </div>
+    <div class="flex gap-2">
+      <label class="px-3 py-1.5 text-sm rounded-lg bg-sky-600 hover:bg-sky-500 cursor-pointer">
+        匯入 CSV/JSON
+        <input id="file" type="file" accept=".csv,.json" multiple class="hidden">
+      </label>
+      <button id="toggleUrl" class="px-3 py-1.5 text-sm rounded-lg bg-slate-700 hover:bg-slate-600">網址載入</button>
+    </div>
+  </header>
+
+  <div id="urlBox" class="hidden bg-slate-800/60 rounded-xl p-3 space-y-2">
+    <p class="text-xs text-slate-400">貼上 CSV 或 JSON 網址（可多個，以空白或換行分隔；個股 CSV 與族群 CSV 可一起載入）</p>
+    <textarea id="urls" rows="2" class="w-full bg-slate-900 rounded-lg p-2 text-sm outline-none" placeholder="https://raw.githubusercontent.com/.../output/stocks_2026-10-06.csv"></textarea>
+    <button id="loadUrl" class="px-3 py-1.5 text-sm rounded-lg bg-sky-600 hover:bg-sky-500">載入</button>
+  </div>
+  <p id="msg" class="text-sm text-amber-300 hidden"></p>
+
+  <!-- 分頁與設定 -->
+  <div class="flex flex-wrap items-center justify-between gap-2">
+    <div class="inline-flex rounded-lg bg-slate-800 p-1 text-sm">
+      <button data-view="overview" class="tab px-4 py-1.5 rounded-md">族群總覽</button>
+      <button data-view="stocks" class="tab px-4 py-1.5 rounded-md">個股明細</button>
+    </div>
+    <div class="inline-flex rounded-lg bg-slate-800 p-1 text-xs items-center">
+      <span class="px-2 text-slate-400">當日漲幅</span>
+      <button data-w="0" class="wbtn px-3 py-1 rounded-md">平均</button>
+      <button data-w="1" class="wbtn px-3 py-1 rounded-md">加權</button>
+    </div>
+  </div>
+
+  <!-- 族群總覽 -->
+  <section id="overview" class="space-y-4">
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="bg-slate-800/60 rounded-xl p-3">
+        <h2 class="text-sm font-semibold mb-1">族群資金佔比</h2>
+        <p class="text-[11px] text-slate-500 mb-2">個股可屬多個族群，佔比加總可能超過 100%；圓環為相對比例。</p>
+        <div class="relative h-72"><canvas id="pie"></canvas></div>
+      </div>
+      <div class="bg-slate-800/60 rounded-xl p-3">
+        <h2 class="text-sm font-semibold mb-1">當日漲幅 vs 5 日漲幅</h2>
+        <p class="text-[11px] text-slate-500 mb-2">深色＝當日、淺色＋外框＝5 日；紅漲綠跌。</p>
+        <div id="barWrap" class="relative h-72"><canvas id="bar"></canvas></div>
+      </div>
+    </div>
+    <div id="cards" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+  </section>
+
+  <!-- 個股明細 -->
+  <section id="stocks" class="space-y-3 hidden">
+    <div id="chips" class="flex gap-2 overflow-x-auto pb-1"></div>
+    <div class="bg-slate-800/60 rounded-xl overflow-x-auto">
+      <table class="w-full min-w-[680px] text-sm">
+        <thead class="text-slate-400 text-xs">
+          <tr id="thead"></tr>
+        </thead>
+        <tbody id="tbody" class="divide-y divide-slate-700/50"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="text-[11px] text-slate-500 pb-6">成交金額為收盤價 × 成交股數之近似值，單位：億元。僅供參考，非投資建議。</footer>
+</div>
+
+<script>
+/* ===== 設定 =====
+ * 預設載入的資料網址（相對於 index.html）。載入失敗時自動使用下方示範資料。
+ * 若 Python 腳本另存一份固定檔名（如 stocks_latest.csv），就能每天自動更新。 */
+const CONFIG = { DEFAULT_URLS: ["output/stocks_latest.csv", "output/sectors_latest.csv"] };
+
+/* ===== JSON 資料結構（與 Python 產出欄位一一對應）=====
+ * {
+ *   "date": "2026-10-06",
+ *   "stocks": [{ code, name, close, pct1d, pct5d, turnoverYi, sectors: ["族群A", ...] }],
+ *   "sectors": [{ name, count, avg1d, wavg1d, avg5d, turnoverYi, share }]   // 選填；缺少時由個股自動計算
+ * }
+ * CSV 欄位：stocks_*.csv → 代號,名稱,日期,收盤價,當日漲跌幅(%),近5日漲跌幅(%),成交金額(元),成交金額(億),所屬族群
+ *          sectors_*.csv → 族群,有效檔數,設定檔數,當日平均漲幅(%),當日加權漲幅(%),近5日平均漲幅(%),成交金額(億),資金占比(%) */
+const SAMPLE = { date: "示範", stocks: [
+  {code:"2330",name:"台積電",close:1050,pct1d:1.25,pct5d:3.10,turnoverYi:520.3,sectors:["半導體"]},
+  {code:"2454",name:"聯發科",close:1520,pct1d:-0.65,pct5d:1.20,turnoverYi:88.4,sectors:["半導體"]},
+  {code:"3711",name:"日月光投控",close:168,pct1d:0.90,pct5d:2.40,turnoverYi:40.2,sectors:["半導體"]},
+  {code:"2383",name:"台光電",close:2150,pct1d:3.40,pct5d:8.20,turnoverYi:95.6,sectors:["銅箔基板概念股","PCB概念股"]},
+  {code:"6213",name:"聯茂",close:148,pct1d:2.10,pct5d:5.50,turnoverYi:22.3,sectors:["銅箔基板概念股"]},
+  {code:"6274",name:"台燿",close:560,pct1d:1.60,pct5d:4.10,turnoverYi:30.8,sectors:["銅箔基板概念股"]},
+  {code:"3081",name:"聯亞",close:520,pct1d:-1.80,pct5d:-3.20,turnoverYi:18.7,sectors:["光通訊概念股"]},
+  {code:"4979",name:"華星光",close:410,pct1d:-2.40,pct5d:-1.50,turnoverYi:25.1,sectors:["光通訊概念股"]},
+  {code:"1802",name:"台玻",close:24.5,pct1d:0.40,pct5d:-0.80,turnoverYi:6.2,sectors:["玻璃基板概念股"]},
+  {code:"3189",name:"景碩",close:165,pct1d:1.10,pct5d:2.90,turnoverYi:9.8,sectors:["玻璃基板概念股","PCB概念股"]},
+  {code:"3037",name:"欣興",close:190,pct1d:0.80,pct5d:1.70,turnoverYi:35.4,sectors:["PCB概念股"]},
+  {code:"2368",name:"金像電",close:420,pct1d:-0.30,pct5d:0.60,turnoverYi:28.9,sectors:["PCB概念股"]}
+]};
+
+/* ===== 狀態 ===== */
+const S = { data:null, sample:false, view:"overview", filter:null, weighted:false, sort:{key:"pct1d",dir:-1} };
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+/* ===== 格式化（紅漲綠跌）===== */
+const pct = v => (v > 0 ? "+" : "") + v.toFixed(2) + "%";
+const yi = v => v.toLocaleString("zh-TW", {minimumFractionDigits:2, maximumFractionDigits:2}) + " 億";
+const col = v => v > 0 ? "text-red-400" : v < 0 ? "text-green-400" : "text-slate-400";
+const RED = a => `rgba(239,68,68,${a})`, GREEN = a => `rgba(34,197,94,${a})`;
+
+/* ===== CSV 解析（支援 BOM、引號）===== */
+function parseCSV(text) {
+  text = text.replace(/^\uFEFF/, "");
+  const rows = []; let row = [], cur = "", q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { if (c === '"') { if (text[i+1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
+    else if (c === '"') q = true;
+    else if (c === ",") { row.push(cur); cur = ""; }
+    else if (c === "\n" || c === "\r") { if (c === "\r" && text[i+1] === "\n") i++; row.push(cur); rows.push(row); row = []; cur = ""; }
+    else cur += c;
+  }
+  if (cur || row.length) { row.push(cur); rows.push(row); }
+  const [h, ...body] = rows.filter(r => r.some(x => x.trim() !== ""));
+  return h ? body.map(r => Object.fromEntries(h.map((k, i) => [k.trim(), (r[i] ?? "").trim()]))) : [];
+}
+
+/* ===== 欄位正規化 ===== */
+const num = v => parseFloat(String(v).replace(/,/g, "")) || 0;
+const findKey = (o, re) => Object.keys(o).find(k => re.test(k));
+function normStock(r) {
+  const k5 = findKey(r, /^近\d+日漲跌幅/);
+  return { code: r["代號"], name: r["名稱"], date: r["日期"], close: num(r["收盤價"]),
+    pct1d: num(r["當日漲跌幅(%)"]), pct5d: num(r[k5]),
+    turnoverYi: r["成交金額(億)"] !== undefined ? num(r["成交金額(億)"]) : num(r["成交金額(元)"]) / 1e8,
+    sectors: (r["所屬族群"] || "").split(/[、,]/).map(s => s.trim()).filter(Boolean) };
+}
+function normSector(r) {
+  const k5 = findKey(r, /^近\d+日平均漲幅/);
+  return { name: r["族群"], count: num(r["有效檔數"]), avg1d: num(r["當日平均漲幅(%)"]),
+    wavg1d: num(r["當日加權漲幅(%)"]), avg5d: num(r[k5]), turnoverYi: num(r["成交金額(億)"]), share: num(r["資金占比(%)"]) };
+}
+
+/* 若沒有族群檔，直接由個股計算（邏輯同 Python 腳本）*/
+function computeSectors(stocks) {
+  const total = stocks.reduce((a, s) => a + s.turnoverYi, 0) || 1;
+  const m = {};
+  stocks.forEach(s => s.sectors.forEach(n => (m[n] ||= []).push(s)));
+  return Object.entries(m).map(([name, g]) => {
+    const t = g.reduce((a, s) => a + s.turnoverYi, 0);
+    return { name, count: g.length,
+      avg1d: g.reduce((a, s) => a + s.pct1d, 0) / g.length,
+      wavg1d: t > 0 ? g.reduce((a, s) => a + s.pct1d * s.turnoverYi, 0) / t : 0,
+      avg5d: g.reduce((a, s) => a + s.pct5d, 0) / g.length,
+      turnoverYi: t, share: t / total * 100 };
+  });
+}
+
+/* ===== 載入資料 ===== */
+function ingest(texts) {
+  let stocks = null, sectors = null, date = null;
+  for (const t0 of texts) {
+    const t = t0.trim();
+    if (t.startsWith("{")) { const j = JSON.parse(t); stocks = j.stocks; sectors = j.sectors; date = j.date; continue; }
+    const rows = parseCSV(t); if (!rows.length) continue;
+    if ("代號" in rows[0]) stocks = rows.map(normStock);
+    else if ("族群" in rows[0]) sectors = rows.map(normSector);
+  }
+  if (!stocks || !stocks.length) throw new Error("找不到個股資料（CSV 需含「代號」欄位）");
+  S.data = { date: date || stocks[0].date || "-", stocks, sectors: sectors && sectors.length ? sectors : computeSectors(stocks) };
+  S.sample = false; S.filter = null;
+}
+async function fetchTexts(urls) {
+  return Promise.all(urls.map(async u => { const r = await fetch(u, {cache:"no-store"}); if (!r.ok) throw new Error(u + " → " + r.status); return r.text(); }));
+}
+function showMsg(t) { $("msg").textContent = t; $("msg").classList.toggle("hidden", !t); }
+
+/* ===== 繪圖 ===== */
+Chart.defaults.color = "#94a3b8"; Chart.defaults.borderColor = "rgba(148,163,184,.15)";
+const PAL = ["#38bdf8","#a78bfa","#fbbf24","#2dd4bf","#f472b6","#818cf8","#fb923c","#a3e635","#22d3ee","#e879f9"];
+let pieC, barC;
+const v1 = s => S.weighted ? s.wavg1d : s.avg1d;
+
+function renderCharts() {
+  const sec = [...S.data.sectors].sort((a, b) => b.turnoverYi - a.turnoverYi);
+  pieC?.destroy();
+  pieC = new Chart($("pie"), { type:"doughnut",
+    data:{ labels: sec.map(s => s.name), datasets:[{ data: sec.map(s => s.share), backgroundColor: sec.map((_, i) => PAL[i % PAL.length]), borderWidth:0 }] },
+    options:{ responsive:true, maintainAspectRatio:false, cutout:"58%",
+      plugins:{ legend:{ position:"bottom", labels:{ boxWidth:10, font:{size:11} } },
+        tooltip:{ callbacks:{ label: c => ` ${c.label}: ${c.parsed.toFixed(2)}%（${yi(sec[c.dataIndex].turnoverYi)}）` } } },
+      onClick:(e, els) => { if (els.length) pick(sec[els[0].index].name); } } });
+
+  const bs = [...S.data.sectors].sort((a, b) => v1(b) - v1(a));
+  $("barWrap").style.height = Math.max(288, bs.length * 56 + 60) + "px";
+  const colorOf = a => c => (c.raw >= 0 ? RED(a) : GREEN(a));
+  barC?.destroy();
+  barC = new Chart($("bar"), { type:"bar",
+    data:{ labels: bs.map(s => s.name), datasets:[
+      { label:"當日", data: bs.map(v1), backgroundColor: colorOf(1), borderRadius:3 },
+      { label:"5日", data: bs.map(s => s.avg5d), backgroundColor: colorOf(.4), borderColor: c => c.raw >= 0 ? RED(1) : GREEN(1), borderWidth:1, borderRadius:3 } ] },
+    options:{ indexAxis:"y", responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{ display:false }, tooltip:{ callbacks:{ label: c => ` ${c.dataset.label}：${pct(c.raw)}` } } },
+      scales:{ x:{ ticks:{ callback: v => v + "%" } } },
+      onClick:(e, els) => { if (els.length) pick(bs[els[0].index].name); } } });
+}
+
+/* ===== 渲染 ===== */
+function renderCards() {
+  const list = [...S.data.sectors].sort((a, b) => v1(b) - v1(a));
+  const max = Math.max(...list.map(s => s.share), 1);
+  $("cards").innerHTML = list.map(s => `
+    <button data-sector="${esc(s.name)}" class="card text-left rounded-xl p-4 bg-slate-800/60 hover:bg-slate-700/60 border ${S.filter === s.name ? "border-sky-400" : "border-transparent"} transition">
+      <div class="flex items-start justify-between">
+        <div><div class="font-semibold">${esc(s.name)}</div><div class="text-xs text-slate-500">${s.count} 檔</div></div>
+        <div class="num text-xl font-bold ${col(v1(s))}">${pct(v1(s))}</div>
+      </div>
+      <div class="mt-3 grid grid-cols-2 gap-2 text-xs">
+        <div><div class="text-slate-500">5 日漲幅</div><div class="num ${col(s.avg5d)}">${pct(s.avg5d)}</div></div>
+        <div><div class="text-slate-500">成交金額</div><div class="num">${yi(s.turnoverYi)}</div></div>
+      </div>
+      <div class="mt-3"><div class="flex justify-between text-xs text-slate-500"><span>資金佔比</span><span class="num text-slate-300">${s.share.toFixed(2)}%</span></div>
+        <div class="h-1.5 bg-slate-700 rounded mt-1"><div class="h-1.5 bg-sky-400 rounded" style="width:${Math.min(100, s.share / max * 100)}%"></div></div></div>
+    </button>`).join("");
+}
+
+const COLS = [["name","代號／名稱"],["close","收盤價"],["pct1d","當日漲跌"],["pct5d","5日漲跌"],["turnoverYi","成交金額"],["sectors","所屬族群"]];
+function renderStocks() {
+  const names = S.data.sectors.map(s => s.name);
+  $("chips").innerHTML = [null, ...names].map(n => `<button data-chip="${n === null ? "" : esc(n)}" class="chip shrink-0 px-3 py-1 rounded-full text-sm ${S.filter === n ? "bg-sky-600" : "bg-slate-800 hover:bg-slate-700"}">${n === null ? "全部" : esc(n)}</button>`).join("");
+  $("thead").innerHTML = COLS.map(([k, t], i) => `<th data-sort="${k}" class="sortable ${i === 0 ? "sticky-col text-left" : "text-right"} px-3 py-2 font-medium whitespace-nowrap">${t}${S.sort.key === k ? (S.sort.dir > 0 ? " ▲" : " ▼") : ""}</th>`).join("");
+  const {key, dir} = S.sort;
+  const rows = S.data.stocks.filter(s => !S.filter || s.sectors.includes(S.filter))
+    .sort((a, b) => {
+      const x = key === "sectors" ? a.sectors.join() : a[key === "name" ? "code" : key];
+      const y = key === "sectors" ? b.sectors.join() : b[key === "name" ? "code" : key];
+      return (x > y ? 1 : x < y ? -1 : 0) * dir;
+    });
+  $("tbody").innerHTML = rows.map(s => `<tr class="hover:bg-slate-700/30">
+    <td class="sticky-col px-3 py-2 whitespace-nowrap"><span class="num text-slate-400">${esc(s.code)}</span> <span class="font-medium">${esc(s.name)}</span></td>
+    <td class="num text-right px-3 py-2">${s.close.toFixed(2)}</td>
+    <td class="num text-right px-3 py-2 ${col(s.pct1d)}">${pct(s.pct1d)}</td>
+    <td class="num text-right px-3 py-2 ${col(s.pct5d)}">${pct(s.pct5d)}</td>
+    <td class="num text-right px-3 py-2 whitespace-nowrap">${yi(s.turnoverYi)}</td>
+    <td class="text-right px-3 py-2 text-xs text-slate-400 whitespace-nowrap">${s.sectors.map(esc).join("、")}</td></tr>`).join("")
+    || `<tr><td colspan="6" class="px-3 py-6 text-center text-slate-500">沒有資料</td></tr>`;
+}
+
+function render() {
+  $("date").textContent = S.data.date;
+  $("badge").classList.toggle("hidden", !S.sample);
+  document.querySelectorAll(".tab").forEach(b => b.className = "tab px-4 py-1.5 rounded-md " + (b.dataset.view === S.view ? "bg-sky-600" : "text-slate-300"));
+  document.querySelectorAll(".wbtn").forEach(b => b.className = "wbtn px-3 py-1 rounded-md " + ((b.dataset.w === "1") === S.weighted ? "bg-sky-600" : "text-slate-300"));
+  $("overview").classList.toggle("hidden", S.view !== "overview");
+  $("stocks").classList.toggle("hidden", S.view !== "stocks");
+  renderCards(); renderStocks(); renderCharts();
+}
+function pick(name) { S.filter = name || null; S.view = "stocks"; render(); window.scrollTo({top:0, behavior:"smooth"}); }
+
+/* ===== 事件 ===== */
+document.addEventListener("click", e => {
+  const t = e.target.closest("[data-view],[data-w],[data-sector],[data-chip],[data-sort]"); if (!t) return;
+  if (t.dataset.view) { S.view = t.dataset.view; render(); }
+  else if (t.dataset.w) { S.weighted = t.dataset.w === "1"; render(); }
+  else if (t.dataset.sector) pick(t.dataset.sector);
+  else if (t.dataset.chip !== undefined) { S.filter = t.dataset.chip || null; render(); }
+  else if (t.dataset.sort) { const k = t.dataset.sort; S.sort = { key:k, dir: S.sort.key === k ? -S.sort.dir : -1 }; renderStocks(); }
+});
+$("toggleUrl").onclick = () => $("urlBox").classList.toggle("hidden");
+$("file").onchange = async e => {
+  try { ingest(await Promise.all([...e.target.files].map(f => f.text()))); showMsg(""); render(); }
+  catch (err) { showMsg("匯入失敗：" + err.message); }
+  e.target.value = "";
+};
+$("loadUrl").onclick = async () => {
+  const urls = $("urls").value.split(/[\s,]+/).filter(Boolean); if (!urls.length) return;
+  try { ingest(await fetchTexts(urls)); showMsg(""); render(); }
+  catch (err) { showMsg("載入失敗：" + err.message + "（若為跨網域請求，來源需允許 CORS）"); }
+};
+
+/* ===== 啟動：先嘗試預設網址，失敗則顯示示範資料 ===== */
+(async () => {
+  try {
+    const rs = await Promise.allSettled(CONFIG.DEFAULT_URLS.map(u => fetchTexts([u]).then(a => a[0])));
+    ingest(rs.filter(r => r.status === "fulfilled").map(r => r.value));
+  }
+  catch { S.data = { date: SAMPLE.date, stocks: SAMPLE.stocks, sectors: computeSectors(SAMPLE.stocks) }; S.sample = true; }
+  render();
+})();
+</script>
+</body>
+</html>
