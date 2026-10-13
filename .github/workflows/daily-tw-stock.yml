@@ -2,16 +2,15 @@ name: Daily TW Stock Sector Tracker
 
 on:
   schedule:
-    # GitHub Actions 的 cron 一律使用 UTC。
-    # 台灣時間 (UTC+8) 15:30 = UTC 07:30，週一至週五。
-    # 註：排程高峰時 GitHub 可能延遲數分鐘到十幾分鐘才開跑，屬正常現象。
-    - cron: "30 7 * * 1-5"
+    # GitHub Actions 的 cron 一律使用 UTC（台灣時間 = UTC+8），週一至週五。
+    - cron: "30 7 * * 1-5"    # 台灣時間 15:30
+    - cron: "30 10 * * 1-5"   # 台灣時間 18:30（補跑：避免排程被延遲或略過、Yahoo 資料較晚更新）
   # 允許在 GitHub 網頁上手動觸發（測試用）
   workflow_dispatch:
 
-# 需要寫入權限才能 commit 回儲存庫
 permissions:
-  contents: write
+  contents: write   # 把資料 commit 回儲存庫
+  pages: write      # 請求 GitHub Pages 重新建置網頁
 
 # 避免前一次尚未跑完又觸發下一次，造成 push 衝突
 concurrency:
@@ -20,7 +19,7 @@ concurrency:
 
 jobs:
   run-tracker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     steps:
@@ -31,7 +30,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"   # 依 requirements.txt 快取套件，加快執行速度
+          cache: "pip"
 
       - name: Install dependencies
         run: |
@@ -48,13 +47,19 @@ jobs:
 
           git add output/
 
-          # 沒有變更（例如國定假日休市，抓到的仍是上一個交易日資料）就不 commit
+          # 沒有變更（例如國定假日休市）就不 commit
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
           git commit -m "chore: update TW stock data $(TZ=Asia/Taipei date +'%Y-%m-%d')"
-          # 先 rebase 再 push，降低與其他推送衝突的機率
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      # 重要：用 GITHUB_TOKEN 推送的 commit 不會自動觸發 GitHub Pages 重新建置，
+      # 網頁會一直停在舊資料，所以這裡明確請求一次建置（無論本次有沒有新 commit）。
+      - name: Trigger GitHub Pages build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds"
