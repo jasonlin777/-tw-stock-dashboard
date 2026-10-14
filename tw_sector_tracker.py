@@ -1,43 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-台股族群分類與每日盤後資料追蹤
+台股族群分類與每日盤後資料追蹤（官方資料版）
 ==============================================================
-功能：
-  1. 以 yfinance 抓取個股日線資料（上市 .TW、上櫃 .TWO 自動判斷）
-  2. 計算個股：收盤價、當日漲跌幅、近 5 日累積漲跌幅、成交金額
-  3. 依自訂族群字典計算：
-       - 族群當日漲幅（簡單平均 / 成交金額加權平均）
-       - 族群近 5 日漲幅（簡單平均）
-       - 資金占比（族群成交金額 / 所有追蹤個股總成交金額）
-  4. 輸出 CSV（UTF-8 with BOM，Excel 可直接開啟）並回傳 DataFrame
+資料來源：
+  * 收盤價、漲跌、成交金額：證交所 OpenAPI（上市）＋櫃買中心 OpenAPI（上櫃）
+      - 成交金額為官方 TradeValue / TransactionAmount，不再用「收盤價×成交量」近似
+      - 當日漲跌幅以官方「漲跌」換算（參考價＝收盤價－漲跌），與看盤軟體一致
+  * 近 5 日漲幅所需的歷史收盤：
+      - 優先使用 output/history.csv（每次執行把當日官方資料累積進去）
+      - 歷史不足時，才用 yfinance（auto_adjust=False，未還原）回補缺少的日期
+        yfinance 只負責補歷史，絕不用來決定「最新交易日」的價格
+
+防呆：
+  * 最新交易日以官方資料的日期為準；上市、上櫃日期不一致時，不覆寫輸出（等下一次排程）
+  * 官方資料日期比現有 stocks_latest.csv 更舊時，不覆寫
+  * 抓不到官方資料時直接報錯（讓 GitHub Actions 顯示失敗），不會悄悄使用舊資料
 
 安裝：
-    pip install yfinance pandas
+    pip install -r requirements.txt     # pandas、requests、yfinance
 
 執行：
     python tw_sector_tracker.py
-
-排程（每日盤後 14:30 之後執行，例如 15:00）：
-    Linux/macOS crontab:  0 15 * * 1-5 /usr/bin/python3 /path/tw_sector_tracker.py
-    Windows：工作排程器
-
-注意：
-  * yfinance 沒有「成交金額」欄位，本程式以「收盤價 × 成交股數」近似。
-    若需要證交所官方成交金額，可改用 TWSE OpenAPI（見檔尾說明）。
-  * 同一檔股票可同時屬於多個族群（例如同時是 PCB 與 CCL 概念）。
-    各族群資金占比的分母是「不重複個股」的總成交金額，
-    因此各族群占比加總可能超過 100%，這是正常現象。
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import os
-from typing import Dict, List, Tuple
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
-import yfinance as yf
+import requests
+
+# 注意：yfinance 只在需要回補歷史時才 import（見 backfill_with_yfinance）
 
 # ----------------------------------------------------------------------
 # 1. 設定區
@@ -766,124 +764,339 @@ SECTORS: Dict[str, Dict[str, str]] = {
 # 近幾日累積漲跌幅（5 個交易日）
 N_DAYS = 5
 
-# 抓取的歷史長度：N_DAYS 需要至少 N_DAYS+1 筆資料，抓一個月較保險（含假日）
-HISTORY_PERIOD = "1mo"
-
-# 輸出資料夾
+# 輸出資料夾與歷史收盤累積檔（每次執行把當日官方資料寫進去，之後就不太需要 yfinance）
 OUTPUT_DIR = "output"
+HISTORY_FILE = "history.csv"
+HISTORY_KEEP_DAYS = 40      # 歷史檔最多保留幾個交易日
 
 # 成交金額單位換算：1 億 = 1e8
 YI = 1e8
 
+# 官方資料網址
+TWSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+TPEX_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+
+TZ_TW = dt.timezone(dt.timedelta(hours=8))
+
+
+class StaleDataError(Exception):
+    """官方資料還沒更新完（日期不一致或比現有資料舊），本次不應覆寫輸出。"""
+
+
+def warn(msg: str) -> None:
+    """印出警告；在 GitHub Actions 會顯示為 workflow 的 warning 註記。"""
+    print(f"::warning::{msg}", flush=True)
+
 
 # ----------------------------------------------------------------------
-# 2. 資料抓取
+# 2. 官方資料抓取（證交所＋櫃買中心）
 # ----------------------------------------------------------------------
 
-def _download_batch(codes: list[str], suffix: str) -> Dict[str, pd.DataFrame]:
+def _get_json(url: str) -> list:
+    """GET JSON，最多重試 3 次；回傳內容必須是非空 list。"""
+    headers = {"User-Agent": "Mozilla/5.0 (tw-stock-dashboard)", "Accept": "application/json"}
+    verify = True
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(url, headers=headers, timeout=30, verify=verify)
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list) or not data:
+                raise ValueError("回傳內容為空或格式不符")
+            return data
+        except requests.exceptions.SSLError as e:
+            # 證交所憑證偶爾驗證失敗（公開唯讀資料）；退一步關閉驗證重試，並留下警告
+            last_err = e
+            if verify:
+                warn(f"{url} SSL 驗證失敗，改用 verify=False 重試")
+                verify = False
+                try:
+                    import urllib3
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                except Exception:
+                    pass
+        except Exception as e:  # 網路錯誤、HTTP 錯誤、JSON 解析錯誤
+            last_err = e
+        time.sleep(3 * attempt)
+    raise RuntimeError(f"抓取失敗：{url}（{last_err}）")
+
+
+def _to_num(s: pd.Series) -> pd.Series:
+    """字串轉數字：去掉逗號、空白、正號；'--'、'X0.00' 之類無法轉換者變 NaN。"""
+    return pd.to_numeric(s.astype(str).str.replace(r"[,\s+]", "", regex=True), errors="coerce")
+
+
+def _parse_date(v) -> Optional[dt.date]:
+    """支援民國 7 碼（1151014）、民國 6 碼（991013）、西元 8 碼（20261014）、含 / 或 - 的格式。"""
+    s = str(v).strip().replace("/", "").replace("-", "")
+    if not s.isdigit():
+        return None
+    try:
+        if len(s) == 8:
+            return dt.date(int(s[:4]), int(s[4:6]), int(s[6:]))
+        if len(s) in (6, 7):
+            return dt.date(int(s[:-4]) + 1911, int(s[-4:-2]), int(s[-2:]))
+    except ValueError:
+        return None
+    return None
+
+
+def _pick(df: pd.DataFrame, candidates: List[str], source: str) -> str:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise RuntimeError(f"{source} 找不到欄位 {candidates}，實際欄位：{list(df.columns)}（API 格式可能改版）")
+
+
+def _fetch_market(url: str, source: str, market: str, cols: Dict[str, List[str]]) -> pd.DataFrame:
+    """抓一個市場的當日行情，整理成統一欄位。"""
+    df = pd.DataFrame(_get_json(url))
+    c = {k: _pick(df, v, source) for k, v in cols.items() if k != "shares"}
+    shares_col = next((x for x in cols["shares"] if x in df.columns), None)
+
+    out = pd.DataFrame({
+        "代號": df[c["code"]].astype(str).str.strip(),
+        "日期": df[c["date"]].map(_parse_date),
+        "收盤價": _to_num(df[c["close"]]),
+        "漲跌": _to_num(df[c["change"]]),
+        "成交金額(元)": _to_num(df[c["value"]]),
+        "市場": market,
+    })
+    # 單位自我檢查：成交金額 ≈ 收盤價 × 成交股數（只抽查有成交的股票）。差太多代表欄位單位或意義變了
+    if shares_col:
+        shares = _to_num(df[shares_col])
+        ok = (out["收盤價"] > 0) & (shares > 0) & (out["成交金額(元)"] > 0)
+        if ok.sum() > 50:
+            ratio = (out.loc[ok, "成交金額(元)"] / (out.loc[ok, "收盤價"] * shares[ok])).median()
+            if not 0.5 <= ratio <= 2:
+                raise RuntimeError(f"{source} 成交金額單位疑似異常（金額/(價×量) 中位數 = {ratio:.3f}）")
+
+    out = out.dropna(subset=["日期"]).drop_duplicates("代號", keep="first")
+    if out.empty:
+        raise RuntimeError(f"{source} 沒有可解析的日期欄位內容")
+    return out
+
+
+def fetch_twse() -> pd.DataFrame:
+    return _fetch_market(TWSE_URL, "證交所 STOCK_DAY_ALL", "TWSE", {
+        "code": ["Code"], "date": ["Date"], "close": ["ClosingPrice"],
+        "change": ["Change"], "value": ["TradeValue"], "shares": ["TradeVolume"],
+    })
+
+
+def fetch_tpex() -> pd.DataFrame:
+    return _fetch_market(TPEX_URL, "櫃買中心 daily_close_quotes", "TPEX", {
+        "code": ["SecuritiesCompanyCode", "Code"], "date": ["Date"],
+        "close": ["Close", "ClosingPrice"], "change": ["Change"],
+        "value": ["TransactionAmount", "TradeValue"],
+        "shares": ["TradingShares", "TradeVolume"],
+    })
+
+
+def fetch_official(codes: List[str]) -> Tuple[pd.DataFrame, dt.date]:
     """
-    一次下載多檔股票，回傳 {代號: DataFrame(Close, Volume)}。
-    只回傳「資料筆數足夠」的股票；抓不到的由呼叫端改用其他後綴重試。
+    抓上市＋上櫃官方當日行情，只保留追蹤的代號。
+    回傳 (官方資料 DataFrame, 最新交易日)。上市與上櫃日期不一致 → StaleDataError。
     """
-    if not codes:
+    twse, tpex = fetch_twse(), fetch_tpex()
+    d_twse, d_tpex = twse["日期"].max(), tpex["日期"].max()
+    print(f"官方資料日期：上市 {d_twse}、上櫃 {d_tpex}")
+    if d_twse != d_tpex:
+        raise StaleDataError(f"上市資料日期 {d_twse} 與上櫃資料日期 {d_tpex} 不一致（較舊的一方可能尚未更新）")
+    trade_date = d_twse
+
+    allq = pd.concat([twse, tpex], ignore_index=True)
+    allq = allq[allq["日期"] == trade_date]
+    allq = allq[allq["代號"].isin(codes)]
+
+    no_price = allq[~(allq["收盤價"] > 0)]["代號"].tolist()
+    if no_price:
+        print(f"[提醒] 以下代號當日無收盤價（停牌或未成交），略過：{no_price}")
+    allq = allq[allq["收盤價"] > 0].reset_index(drop=True)
+    allq["來源"] = "official"
+    return allq, trade_date
+
+
+# ----------------------------------------------------------------------
+# 3. yfinance（只用來補歷史收盤、或補官方清單查不到的代號）
+# ----------------------------------------------------------------------
+
+def yf_download(ticker_by_code: Dict[str, str]) -> Dict[str, pd.DataFrame]:
+    """下載 {代號: DataFrame(Close, Volume)}；auto_adjust=False 取得未還原收盤價。失敗回傳空 dict。"""
+    if not ticker_by_code:
+        return {}
+    try:
+        import yfinance as yf
+        raw = yf.download(
+            list(ticker_by_code.values()), period="2mo", interval="1d",
+            auto_adjust=False, group_by="ticker", progress=False, threads=True,
+        )
+    except Exception as e:
+        warn(f"yfinance 下載失敗：{e}")
         return {}
 
-    tickers = [f"{c}{suffix}" for c in codes]
-    raw = yf.download(
-        tickers,
-        period=HISTORY_PERIOD,
-        interval="1d",
-        auto_adjust=False,   # 不還原股利，才會與盤面收盤價、漲跌幅一致
-        group_by="ticker",   # 欄位為 (ticker, 欄位名) 的 MultiIndex
-        progress=False,
-        threads=True,
-    )
-
-    result: Dict[str, pd.DataFrame] = {}
-    for code, ticker in zip(codes, tickers):
+    out: Dict[str, pd.DataFrame] = {}
+    for code, ticker in ticker_by_code.items():
         try:
-            # 單一股票時 yfinance 可能不回傳 MultiIndex，這裡一併處理
             df = raw[ticker] if isinstance(raw.columns, pd.MultiIndex) else raw
             df = df[["Close", "Volume"]].dropna()
         except (KeyError, TypeError):
             continue
-        # 至少要有 N_DAYS + 1 筆收盤價才算得出 N 日漲幅
-        if len(df) >= N_DAYS + 1:
-            result[code] = df
-    return result
-
-
-def fetch_price_history(codes: list[str]) -> Dict[str, pd.DataFrame]:
-    """
-    先以上市(.TW)抓取，抓不到的再以上櫃(.TWO)重試。
-    回傳 {代號: DataFrame}；兩邊都抓不到的代號會被略過並印出警告。
-    """
-    data = _download_batch(codes, ".TW")
-
-    missing = [c for c in codes if c not in data]
-    if missing:
-        data.update(_download_batch(missing, ".TWO"))
-
-    still_missing = [c for c in codes if c not in data]
-    if still_missing:
-        print(f"[警告] 以下代號抓不到資料（請確認代號/是否停牌）：{still_missing}")
-    return data
+        if len(df):
+            out[code] = df
+    return out
 
 
 # ----------------------------------------------------------------------
-# 3. 個股指標計算
+# 4. 歷史收盤累積檔（output/history.csv）
 # ----------------------------------------------------------------------
 
-def build_stock_table(history: Dict[str, pd.DataFrame],
-                      names: Dict[str, str]) -> pd.DataFrame:
+HIST_COLS = ["日期", "代號", "收盤價", "成交金額(元)", "來源"]
+
+
+def load_history(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=HIST_COLS)
+    df = pd.read_csv(path, dtype={"代號": str}, encoding="utf-8-sig")
+    df["日期"] = pd.to_datetime(df["日期"]).dt.date
+    return df[HIST_COLS]
+
+
+def upsert_history(hist: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
+    """合併；同一天同一檔以官方資料優先於 yfinance。"""
+    if new is None or new.empty:
+        return hist
+    all_ = pd.concat([hist, new[HIST_COLS]], ignore_index=True)
+    all_["_p"] = (all_["來源"] != "official").astype(int)
+    all_ = (all_.sort_values(["日期", "代號", "_p"])
+                .drop_duplicates(["日期", "代號"], keep="first")
+                .drop(columns="_p"))
+    return all_.reset_index(drop=True)
+
+
+def trim_history(hist: pd.DataFrame) -> pd.DataFrame:
+    keep = sorted(hist["日期"].unique())[-HISTORY_KEEP_DAYS:]
+    return hist[hist["日期"].isin(keep)].sort_values(["日期", "代號"]).reset_index(drop=True)
+
+
+def expected_prior_dates(hist: pd.DataFrame, trade_date: dt.date) -> List[dt.date]:
+    """交易日當天之前的最近 N_DAYS 個交易日：以 2330 的日線當交易日曆，抓不到才用本地歷史推算。"""
+    cal = yf_download({"2330": "2330.TW"}).get("2330")
+    if cal is not None:
+        dates = sorted({ts.date() for ts in cal.index if ts.date() < trade_date})
+        if len(dates) >= N_DAYS:
+            return dates[-N_DAYS:]
+    warn("無法由 yfinance 取得交易日曆，改以本地歷史檔推算")
+    return sorted(d for d in hist["日期"].unique() if d < trade_date)[-N_DAYS:]
+
+
+def ensure_history(hist: pd.DataFrame, official: pd.DataFrame, trade_date: dt.date) -> pd.DataFrame:
     """
-    將每檔股票的歷史資料轉成「最新交易日」的指標一列。
-    欄位：
-      代號、名稱、日期、收盤價、當日漲跌幅(%)、近N日漲跌幅(%)、
-      成交金額(元)、成交金額(億)
+    確認每檔股票都有「交易日前最近 N_DAYS 個交易日」的收盤價；
+    缺的（第一次執行、或排程漏跑幾天）才用 yfinance 回補。
     """
+    expected = expected_prior_dates(hist, trade_date)
+    prior = hist[hist["日期"] < trade_date]
+    n_prior = prior.groupby("代號").size()
+    n_expected = prior[prior["日期"].isin(expected)].groupby("代號")["日期"].nunique()
+
+    need = [c for c in official["代號"]
+            if n_prior.get(c, 0) < N_DAYS or n_expected.get(c, 0) < len(expected)]
+    if not need:
+        return hist
+
+    print(f"歷史收盤不足的股票 {len(need)} 檔，以 yfinance 回補（僅補歷史，不影響最新價）…")
+    market = dict(zip(official["代號"], official["市場"]))
+    tickers = {c: f"{c}.TW" if market[c] == "TWSE" else f"{c}.TWO" for c in need}
+    fetched = yf_download(tickers)
+
     rows = []
-    for code, df in history.items():
-        close, volume = df["Close"], df["Volume"]
+    for code, df in fetched.items():
+        for ts, r in df.iterrows():
+            d = ts.date()
+            if d < trade_date:
+                rows.append({"日期": d, "代號": code, "收盤價": float(r["Close"]),
+                             "成交金額(元)": float(r["Close"] * r["Volume"]), "來源": "yfinance"})
+    return upsert_history(hist, pd.DataFrame(rows, columns=HIST_COLS))
 
-        last_close = close.iloc[-1]
-        prev_close = close.iloc[-2]           # 前一交易日收盤
-        base_close = close.iloc[-(N_DAYS + 1)]  # N 個交易日前的收盤
 
-        pct_1d = (last_close / prev_close - 1) * 100
-        pct_nd = (last_close / base_close - 1) * 100
+def fallback_missing_with_yfinance(missing: List[str], trade_date: dt.date) -> pd.DataFrame:
+    """官方清單查不到的代號（例如興櫃、剛改代號）：用 yfinance 備援，但最新日期必須等於官方交易日。"""
+    rows = []
+    got: Dict[str, pd.DataFrame] = {}
+    for suffix in (".TW", ".TWO"):
+        todo = {c: f"{c}{suffix}" for c in missing if c not in got}
+        got.update(yf_download(todo))
+    for code, df in got.items():
+        if len(df) < 2 or df.index[-1].date() != trade_date:
+            continue
+        close, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
+        rows.append({"代號": code, "日期": trade_date, "收盤價": close, "漲跌": close - prev,
+                     "成交金額(元)": close * float(df["Volume"].iloc[-1]),   # 近似值
+                     "市場": "YF", "來源": "yfinance"})
+    return pd.DataFrame(rows)
 
-        # 成交金額（近似）= 收盤價 × 成交股數
-        turnover = float(last_close * volume.iloc[-1])
 
+# ----------------------------------------------------------------------
+# 5. 個股指標計算
+# ----------------------------------------------------------------------
+
+def build_stock_table(official: pd.DataFrame, hist: pd.DataFrame,
+                      names: Dict[str, str], trade_date: dt.date) -> pd.DataFrame:
+    """
+    欄位：代號、名稱、日期、收盤價、當日漲跌幅(%)、近N日漲跌幅(%)、成交金額(元)、成交金額(億)
+      * 當日漲跌幅：官方「漲跌」換算，前收（參考價）＝收盤價－漲跌
+        例：收盤 319、漲 16 → 前收 303 → +5.28%
+      * 除權息日官方漲跌可能顯示為 0（X0.00）：若與歷史前收差超過 1%，改用歷史前收
+      * 近 N 日漲跌幅：收盤價 vs. 第 N 個前一交易日的收盤價（未還原）
+    """
+    prior = hist[hist["日期"] < trade_date].sort_values("日期")
+    closes = {code: g["收盤價"].tolist() for code, g in prior.groupby("代號")}
+
+    rows, no_hist, mismatch = [], [], []
+    for r in official.to_dict("records"):
+        code = r["代號"]
+        series = closes.get(code, [])
+        prev_hist = series[-1] if series else None
+        close, change = float(r["收盤價"]), r["漲跌"]
+
+        prev = None
+        if pd.notna(change) and close - change > 0:
+            prev = close - float(change)
+            if prev_hist and float(change) == 0 and abs(close / prev_hist - 1) > 0.01:
+                prev = prev_hist                         # 疑似除權息日，官方漲跌不可比
+            elif prev_hist and abs(prev / prev_hist - 1) > 0.02:
+                mismatch.append(code)                   # 前收與歷史收盤差異大，留下提醒
+        elif prev_hist:
+            prev = prev_hist
+
+        if prev is None or len(series) < N_DAYS:
+            no_hist.append(code)
+            continue
+        base = series[-N_DAYS]
+
+        turnover = float(r["成交金額(元)"]) if pd.notna(r["成交金額(元)"]) else 0.0
         rows.append({
             "代號": code,
             "名稱": names.get(code, ""),
-            "日期": close.index[-1].date(),
-            "收盤價": round(float(last_close), 2),
-            "當日漲跌幅(%)": round(float(pct_1d), 2),
-            f"近{N_DAYS}日漲跌幅(%)": round(float(pct_nd), 2),
+            "日期": trade_date,
+            "收盤價": round(close, 2),
+            "當日漲跌幅(%)": round((close / prev - 1) * 100, 2),
+            f"近{N_DAYS}日漲跌幅(%)": round((close / base - 1) * 100, 2),
             "成交金額(元)": turnover,
             "成交金額(億)": round(turnover / YI, 2),
         })
 
-    stock_df = pd.DataFrame(rows)
-    if stock_df.empty:
-        return stock_df
-
-    # 若部分股票最新資料日期落後（停牌等），以多數股票的最新日期為準，
-    # 避免把不同日期的資料混在一起計算。
-    trade_date = stock_df["日期"].max()
-    stale = stock_df[stock_df["日期"] != trade_date]
-    if not stale.empty:
-        print(f"[警告] 以下股票最新資料不是 {trade_date}，已排除：{stale['代號'].tolist()}")
-        stock_df = stock_df[stock_df["日期"] == trade_date]
-
-    return stock_df.reset_index(drop=True)
+    if no_hist:
+        warn(f"以下股票缺少前收或 {N_DAYS} 日歷史收盤，已略過：{no_hist}")
+    if mismatch:
+        print(f"[提醒] 官方漲跌換算的前收與歷史收盤差異 >2%（可能除權息或歷史缺漏）：{mismatch}")
+    return pd.DataFrame(rows)
 
 
 # ----------------------------------------------------------------------
-# 4. 族群指標計算
+# 6. 族群指標計算
 # ----------------------------------------------------------------------
 
 def build_sector_table(stock_df: pd.DataFrame,
@@ -934,7 +1147,7 @@ def build_sector_table(stock_df: pd.DataFrame,
 
 
 # ----------------------------------------------------------------------
-# 5. 主流程
+# 7. 明細表與主流程
 # ----------------------------------------------------------------------
 
 def build_detail_table(stock_df: pd.DataFrame) -> pd.DataFrame:
@@ -962,71 +1175,93 @@ def build_detail_table(stock_df: pd.DataFrame) -> pd.DataFrame:
     return merged[cols].reset_index(drop=True)
 
 
+def _existing_latest_date(output_dir: str) -> Optional[dt.date]:
+    """讀現有 stocks_latest.csv 的最新日期（沒有檔案就回傳 None）。"""
+    path = os.path.join(output_dir, "stocks_latest.csv")
+    if not os.path.exists(path):
+        return None
+    try:
+        d = pd.read_csv(path, usecols=["日期"], encoding="utf-8-sig")["日期"]
+        return pd.to_datetime(d).dt.date.max()
+    except Exception:
+        return None
+
+
 def run(output_dir: str = OUTPUT_DIR):
-    """執行完整流程，回傳 (族群×個股明細 DataFrame, 族群摘要 DataFrame)。"""
-    # 整理所有追蹤個股（去重）與名稱對照
+    """執行完整流程，回傳 (族群×個股明細 DataFrame, 族群摘要 DataFrame)；本次略過更新則回傳 (None, None)。"""
     names: Dict[str, str] = {}
     for stocks in SECTORS.values():
         names.update(stocks)
     codes = list(names.keys())
 
-    print(f"追蹤 {len(codes)} 檔個股、{len(SECTORS)} 個族群，下載資料中…")
-    history = fetch_price_history(codes)
+    print(f"追蹤 {len(codes)} 檔個股、{len(SECTORS)} 個族群，抓取官方資料中…")
+    try:
+        official, trade_date = fetch_official(codes)
+    except StaleDataError as e:
+        warn(f"略過本次更新：{e}")
+        return None, None
 
-    stock_df = build_stock_table(history, names)
+    # ---- 日期防呆：官方資料不可比現有輸出更舊 ----
+    existing = _existing_latest_date(output_dir)
+    if existing and trade_date < existing:
+        warn(f"略過本次更新：官方資料日期 {trade_date} 比現有輸出 {existing} 更舊")
+        return None, None
+    now_tw = dt.datetime.now(TZ_TW)
+    if now_tw.weekday() < 5 and now_tw.hour >= 15 and trade_date < now_tw.date():
+        print(f"[提醒] 官方最新資料為 {trade_date}，尚未更新到今天（{now_tw.date()}）；"
+              f"若今天是休市日屬正常，否則等下一次排程補跑。")
+
+    # ---- 官方清單查不到的代號：yfinance 備援（最新日期必須吻合）----
+    missing = [c for c in codes if c not in set(official["代號"])]
+    if missing:
+        fb = fallback_missing_with_yfinance(missing, trade_date)
+        still = [c for c in missing if c not in set(fb["代號"])] if not fb.empty else missing
+        if not fb.empty:
+            warn(f"以下代號官方清單查不到，改用 yfinance（成交金額為近似值）：{fb['代號'].tolist()}")
+            official = pd.concat([official, fb], ignore_index=True)
+        if still:
+            shown = still[:20] + (["…"] if len(still) > 20 else [])
+            print(f"[提醒] {len(still)} 檔官方與 yfinance 都沒有 {trade_date} 的資料，略過：{shown}")
+    if len(official) < len(codes) * 0.5:
+        raise RuntimeError(f"只取得 {len(official)}/{len(codes)} 檔資料，疑似資料來源異常，不覆寫輸出")
+
+    # ---- 歷史收盤（累積檔＋必要時回補）----
+    os.makedirs(output_dir, exist_ok=True)
+    hist_path = os.path.join(output_dir, HISTORY_FILE)
+    hist = ensure_history(load_history(hist_path), official, trade_date)
+
+    # ---- 個股、族群指標 ----
+    stock_df = build_stock_table(official, hist, names, trade_date)
     if stock_df.empty:
-        raise RuntimeError("沒有抓到任何資料，請檢查網路或股票代號。")
-
+        raise RuntimeError("沒有任何股票算得出指標，請檢查資料來源。")
     sector_df = build_sector_table(stock_df, SECTORS)
-
     stock_df = stock_df.sort_values("當日漲跌幅(%)", ascending=False).reset_index(drop=True)
-
-    # 族群×個股明細（含產業分類與說明）：儀表板與 CSV 都用這張表
     detail_df = build_detail_table(stock_df)
 
-    # 輸出 CSV（utf-8-sig 讓 Excel 開啟中文不亂碼）
-    os.makedirs(output_dir, exist_ok=True)
-    trade_date = stock_df["日期"].iloc[0]
+    # ---- 輸出 CSV（utf-8-sig 讓 Excel 開啟中文不亂碼）----
     stock_path = os.path.join(output_dir, f"stocks_{trade_date}.csv")
     sector_path = os.path.join(output_dir, f"sectors_{trade_date}.csv")
-    # 成交金額(元) 轉成整數輸出，避免科學記號
     out_stock = detail_df.copy()
     out_stock["成交金額(元)"] = out_stock["成交金額(元)"].round(0).astype("int64")
     out_stock.to_csv(stock_path, index=False, encoding="utf-8-sig")
     sector_df.to_csv(sector_path, index=False, encoding="utf-8-sig")
-
-    # 另存固定檔名（latest），讓 index.html 儀表板每天讀取同一個網址
+    # 固定檔名（latest）：index.html 儀表板每天讀取同一個網址
     out_stock.to_csv(os.path.join(output_dir, "stocks_latest.csv"), index=False, encoding="utf-8-sig")
     sector_df.to_csv(os.path.join(output_dir, "sectors_latest.csv"), index=False, encoding="utf-8-sig")
 
-    print(f"\n交易日：{trade_date}")
-    print(f"已輸出：{stock_path}\n        {sector_path}\n        {output_dir}/stocks_latest.csv, sectors_latest.csv\n")
+    # ---- 把今天的官方資料累積進歷史檔 ----
+    today_rows = official.rename(columns={"日期": "日期"})[["日期", "代號", "收盤價", "成交金額(元)", "來源"]]
+    trim_history(upsert_history(hist, today_rows)).to_csv(hist_path, index=False, encoding="utf-8-sig")
+
+    n_off = int((official["來源"] == "official").sum())
+    print(f"\n交易日：{trade_date}（官方資料 {n_off} 檔、備援 {len(official) - n_off} 檔）")
+    print(f"已輸出：{stock_path}\n        {sector_path}\n        {output_dir}/stocks_latest.csv, sectors_latest.csv, {HISTORY_FILE}\n")
     print("=== 族群摘要 ===")
     print(sector_df.to_string(index=False))
     print("\n=== 族群×個股明細 ===")
     print(detail_df.drop(columns=["成交金額(元)"]).to_string(index=False))
-
     return detail_df, sector_df
 
 
 if __name__ == "__main__":
     run()
-
-
-# ----------------------------------------------------------------------
-# 附註：改用證交所 OpenAPI 取得「官方成交金額」（選用）
-# ----------------------------------------------------------------------
-# 上市個股日資料（含 TradeValue 成交金額、ClosingPrice、Change 等）：
-#   https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL
-# 上櫃個股日資料：
-#   https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes
-#
-# 範例：
-#   import requests
-#   r = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=15)
-#   df = pd.DataFrame(r.json())          # 欄位 Code, Name, TradeValue, ClosingPrice ...
-#   df["TradeValue"] = pd.to_numeric(df["TradeValue"], errors="coerce")
-#
-# 這兩支 API 只提供「當日」資料，不含歷史；因此近 5 日漲幅仍需 yfinance 或
-# 自行每天存檔累積。可把官方 TradeValue 取代 build_stock_table() 裡
-# 「收盤價 × 成交股數」的近似值。
