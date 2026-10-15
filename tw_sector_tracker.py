@@ -13,9 +13,11 @@
         yfinance 只負責補歷史，絕不用來決定「最新交易日」的價格
 
 防呆：
-  * 最新交易日以官方資料的日期為準；上市、上櫃日期不一致時，不覆寫輸出（等下一次排程）
-  * 官方資料日期比現有 stocks_latest.csv 更舊時，不覆寫
-  * 抓不到官方資料時直接報錯（讓 GitHub Actions 顯示失敗），不會悄悄使用舊資料
+  * 最新交易日 = 上市、上櫃官方資料中較新的日期
+  * 某市場官方資料還沒更新（例如證交所 OpenAPI 晚於櫃買中心）：先試證交所官網版，
+    仍沒有才用 yfinance 暫代（yfinance 最新一筆日期必須等於交易日），官方更新後下次執行自動覆蓋
+  * 取得的股票不足 80% 時不覆寫輸出；官方資料日期比現有 stocks_latest.csv 更舊時也不覆寫
+  * 官方 API 完全抓不到時直接報錯（讓 GitHub Actions 顯示失敗），不會悄悄使用舊資料
 
 安裝：
     pip install -r requirements.txt     # pandas、requests、yfinance
@@ -787,6 +789,8 @@ YI = 1e8
 # 官方資料網址
 TWSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+# 證交所官網版（與 OpenAPI 同類資料，但更新時間可能不同；OpenAPI 太晚更新時當第二官方來源）
+TWSE_SITE_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
 
 TZ_TW = dt.timezone(dt.timedelta(hours=8))
 
@@ -804,8 +808,8 @@ def warn(msg: str) -> None:
 # 2. 官方資料抓取（證交所＋櫃買中心）
 # ----------------------------------------------------------------------
 
-def _get_json(url: str) -> list:
-    """GET JSON，最多重試 3 次；回傳內容必須是非空 list。"""
+def _get_json(url: str, as_dict: bool = False):
+    """GET JSON，最多重試 3 次；回傳內容必須是非空 list（as_dict=True 時為非空 dict）。"""
     headers = {"User-Agent": "Mozilla/5.0 (tw-stock-dashboard)", "Accept": "application/json"}
     verify = True
     last_err: Exception | None = None
@@ -814,7 +818,7 @@ def _get_json(url: str) -> list:
             r = requests.get(url, headers=headers, timeout=30, verify=verify)
             r.raise_for_status()
             data = r.json()
-            if not isinstance(data, list) or not data:
+            if not isinstance(data, dict if as_dict else list) or not data:
                 raise ValueError("回傳內容為空或格式不符")
             return data
         except requests.exceptions.SSLError as e:
@@ -906,28 +910,70 @@ def fetch_tpex() -> pd.DataFrame:
     })
 
 
-def fetch_official(codes: List[str]) -> Tuple[pd.DataFrame, dt.date]:
+def fetch_twse_site() -> pd.DataFrame:
+    """證交所官網版 STOCK_DAY_ALL，格式 {stat, date, fields, data}。
+    「漲跌價差」的正負號格式不確定，所以不採用，漲跌留空，前收改由歷史收盤取得。"""
+    j = _get_json(TWSE_SITE_URL, as_dict=True)
+    if j.get("stat") != "OK" or not j.get("data"):
+        raise RuntimeError(f"證交所官網版回傳狀態 {j.get('stat')}")
+    df = pd.DataFrame(j["data"], columns=j["fields"])
+    d = _parse_date(j.get("date"))
+    if d is None:
+        raise RuntimeError("證交所官網版沒有日期")
+    out = pd.DataFrame({
+        "代號": df[_pick(df, ["證券代號"], "證交所官網")].astype(str).str.strip(),
+        "日期": d,
+        "收盤價": _to_num(df[_pick(df, ["收盤價"], "證交所官網")]),
+        "漲跌": float("nan"),
+        "成交金額(元)": _to_num(df[_pick(df, ["成交金額"], "證交所官網")]),
+        "市場": "TWSE",
+    })
+    return out.drop_duplicates("代號", keep="first")
+
+
+def fetch_official(codes: List[str]) -> Tuple[pd.DataFrame, dt.date, Dict[str, str]]:
     """
     抓上市＋上櫃官方當日行情，只保留追蹤的代號。
-    回傳 (官方資料 DataFrame, 最新交易日)。上市與上櫃日期不一致 → StaleDataError。
+    最新交易日 = 兩個市場中較新的日期。某個市場資料較舊（尚未更新）時：
+      1. 上市較舊 → 先試證交所官網版（更新時間可能比 OpenAPI 早）
+      2. 仍較舊 → 該市場的個股記錄在 stale（代號 → yfinance 後綴），由呼叫端用 yfinance 暫代
+    回傳 (官方資料, 最新交易日, stale)
     """
+    codeset = set(codes)
     twse, tpex = fetch_twse(), fetch_tpex()
     d_twse, d_tpex = twse["日期"].max(), tpex["日期"].max()
     print(f"官方資料日期：上市 {d_twse}、上櫃 {d_tpex}")
-    if d_twse != d_tpex:
-        raise StaleDataError(f"上市資料日期 {d_twse} 與上櫃資料日期 {d_tpex} 不一致（較舊的一方可能尚未更新）")
-    trade_date = d_twse
+    trade_date = max(d_twse, d_tpex)
 
-    allq = pd.concat([twse, tpex], ignore_index=True)
-    allq = allq[allq["日期"] == trade_date]
-    allq = allq[allq["代號"].isin(codes)]
+    if d_twse < trade_date:
+        try:
+            alt = fetch_twse_site()
+            print(f"證交所官網版資料日期：{alt['日期'].max()}")
+            if alt["日期"].max() == trade_date:
+                twse, d_twse = alt, trade_date
+        except Exception as e:
+            print(f"[提醒] 證交所官網版也無法使用：{e}")
 
+    parts: List[pd.DataFrame] = []
+    stale: Dict[str, str] = {}
+    for df, name, suffix in ((twse, "上市", ".TW"), (tpex, "上櫃", ".TWO")):
+        latest = df["日期"].max()
+        if latest == trade_date:
+            parts.append(df[df["日期"] == trade_date])
+        else:
+            mine = [c for c in df["代號"] if c in codeset]
+            stale.update({c: suffix for c in mine})
+            warn(f"{name}官方資料尚未更新（僅到 {latest}，最新交易日 {trade_date}），"
+                 f"{len(mine)} 檔個股改用 yfinance 暫代；官方更新後下次執行會自動覆蓋")
+
+    allq = pd.concat(parts, ignore_index=True)
+    allq = allq[allq["代號"].isin(codeset)]
     no_price = allq[~(allq["收盤價"] > 0)]["代號"].tolist()
     if no_price:
         print(f"[提醒] 以下代號當日無收盤價（停牌或未成交），略過：{no_price}")
     allq = allq[allq["收盤價"] > 0].reset_index(drop=True)
     allq["來源"] = "official"
-    return allq, trade_date
+    return allq, trade_date, stale
 
 
 # ----------------------------------------------------------------------
@@ -1033,21 +1079,25 @@ def ensure_history(hist: pd.DataFrame, official: pd.DataFrame, trade_date: dt.da
     return upsert_history(hist, pd.DataFrame(rows, columns=HIST_COLS))
 
 
-def fallback_missing_with_yfinance(missing: List[str], trade_date: dt.date) -> pd.DataFrame:
-    """官方清單查不到的代號（例如興櫃、剛改代號）：用 yfinance 備援，但最新日期必須等於官方交易日。"""
-    rows = []
-    got: Dict[str, pd.DataFrame] = {}
-    for suffix in (".TW", ".TWO"):
-        todo = {c: f"{c}{suffix}" for c in missing if c not in got}
-        got.update(yf_download(todo))
-    for code, df in got.items():
-        if len(df) < 2 or df.index[-1].date() != trade_date:
-            continue
-        close, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
-        rows.append({"代號": code, "日期": trade_date, "收盤價": close, "漲跌": close - prev,
-                     "成交金額(元)": close * float(df["Volume"].iloc[-1]),   # 近似值
-                     "市場": "YF", "來源": "yfinance"})
-    return pd.DataFrame(rows)
+def fallback_with_yfinance(todo: Dict[str, List[str]], trade_date: dt.date) -> pd.DataFrame:
+    """
+    官方資料還沒到（或官方清單查不到）的代號，用 yfinance 暫代。
+    todo：{代號: [依序嘗試的後綴]}。只接受「最新一筆日期 == 官方交易日」的資料，
+    前收取 yfinance 前一個交易日收盤，成交金額為近似值（收盤價×成交量）。
+    """
+    rows, got = [], set()
+    for k in range(2):
+        batch = {c: f"{c}{sfx[k]}" for c, sfx in todo.items() if c not in got and len(sfx) > k}
+        for code, df in yf_download(batch).items():
+            if len(df) < 2 or df.index[-1].date() != trade_date:
+                continue                                     # 日期不對（Yahoo 還沒更新）→ 不用
+            close, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
+            sfx = todo[code][k]
+            rows.append({"代號": code, "日期": trade_date, "收盤價": close, "漲跌": close - prev,
+                         "成交金額(元)": close * float(df["Volume"].iloc[-1]),
+                         "市場": "TWSE" if sfx == ".TW" else "TPEX", "來源": "yfinance"})
+            got.add(code)
+    return pd.DataFrame(rows, columns=["代號", "日期", "收盤價", "漲跌", "成交金額(元)", "市場", "來源"])
 
 
 # ----------------------------------------------------------------------
@@ -1207,11 +1257,7 @@ def run(output_dir: str = OUTPUT_DIR):
     codes = list(names.keys())
 
     print(f"追蹤 {len(codes)} 檔個股、{len(SECTORS)} 個族群，抓取官方資料中…")
-    try:
-        official, trade_date = fetch_official(codes)
-    except StaleDataError as e:
-        warn(f"略過本次更新：{e}")
-        return None, None
+    official, trade_date, stale = fetch_official(codes)
 
     # ---- 日期防呆：官方資料不可比現有輸出更舊 ----
     existing = _existing_latest_date(output_dir)
@@ -1223,19 +1269,31 @@ def run(output_dir: str = OUTPUT_DIR):
         print(f"[提醒] 官方最新資料為 {trade_date}，尚未更新到今天（{now_tw.date()}）；"
               f"若今天是休市日屬正常，否則等下一次排程補跑。")
 
-    # ---- 官方清單查不到的代號：yfinance 備援（最新日期必須吻合）----
-    missing = [c for c in codes if c not in set(official["代號"])]
-    if missing:
-        fb = fallback_missing_with_yfinance(missing, trade_date)
-        still = [c for c in missing if c not in set(fb["代號"])] if not fb.empty else missing
+    # ---- yfinance 備援：官方還沒更新的市場、以及官方清單查不到的代號 ----
+    have = set(official["代號"])
+    todo: Dict[str, List[str]] = {c: [s] for c, s in stale.items() if c not in have}
+    unknown = [c for c in codes if c not in have and c not in todo]
+    todo.update({c: [".TW", ".TWO"] for c in unknown})
+    if todo:
+        fb = fallback_with_yfinance(todo, trade_date)
         if not fb.empty:
-            warn(f"以下代號官方清單查不到，改用 yfinance（成交金額為近似值）：{fb['代號'].tolist()}")
+            warn(f"{len(fb)} 檔使用 yfinance 資料（成交金額為近似值）；"
+                 f"其中官方清單查不到的：{[c for c in fb['代號'] if c in unknown]}")
             official = pd.concat([official, fb], ignore_index=True)
-        if still:
-            shown = still[:20] + (["…"] if len(still) > 20 else [])
-            print(f"[提醒] {len(still)} 檔官方與 yfinance 都沒有 {trade_date} 的資料，略過：{shown}")
-    if len(official) < len(codes) * 0.5:
-        raise RuntimeError(f"只取得 {len(official)}/{len(codes)} 檔資料，疑似資料來源異常，不覆寫輸出")
+        lost = [c for c in todo if c not in set(official["代號"])]
+        if lost:
+            shown = lost[:20] + (["…"] if len(lost) > 20 else [])
+            print(f"[提醒] {len(lost)} 檔官方與 yfinance 都沒有 {trade_date} 的資料，略過：{shown}")
+
+    coverage = len(official) / len(codes)
+    if coverage < 0.8:
+        msg = f"只取得 {len(official)}/{len(codes)} 檔 {trade_date} 的資料"
+        if stale:
+            warn(f"略過本次更新：{msg}（官方尚未更新、yfinance 也還沒有），等下次排程再試")
+            return None, None
+        if coverage < 0.5:
+            raise RuntimeError(f"{msg}，疑似資料來源異常，不覆寫輸出")
+        warn(msg)
 
     # ---- 歷史收盤（累積檔＋必要時回補）----
     os.makedirs(output_dir, exist_ok=True)
