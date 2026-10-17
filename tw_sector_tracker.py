@@ -262,7 +262,7 @@ SECTOR_DETAIL: Dict[str, Dict[str, List[Tuple[str, str, str]]]] = {
         "晶圓製造": [
             ("3707", "漢磊", "SiC 元件代工"),
             ("2342", "茂矽", "SiC 代工開發與合作"),
-            ("3061", "台亞", "透過積亞製造 SiC 元件"),
+            ("2340", "台亞", "透過積亞製造 SiC 元件"),
         ],
         "功率元件": [
             ("2481", "強茂", "SiC 二極體／MOSFET"),
@@ -809,13 +809,20 @@ def warn(msg: str) -> None:
 # ----------------------------------------------------------------------
 
 def _get_json(url: str, as_dict: bool = False):
-    """GET JSON，最多重試 3 次；回傳內容必須是非空 list（as_dict=True 時為非空 dict）。"""
-    headers = {"User-Agent": "Mozilla/5.0 (tw-stock-dashboard)", "Accept": "application/json"}
+    """
+    GET JSON，最多重試 5 次（等待 5、10、20、40 秒）；回傳內容必須是非空 list（as_dict=True 時為非空 dict）。
+    官方 API 偶爾會中途斷線（例如 "Response ended prematurely"），所以重試次數與等待時間要夠長；
+    第 3 次起改用不壓縮（identity）傳輸，避開壓縮串流被截斷的問題。
+    """
+    max_attempts = 5
     verify = True
     last_err: Exception | None = None
-    for attempt in range(1, 4):
+    for attempt in range(1, max_attempts + 1):
+        headers = {"User-Agent": "Mozilla/5.0 (tw-stock-dashboard)", "Accept": "application/json"}
+        if attempt >= 3:
+            headers["Accept-Encoding"] = "identity"
         try:
-            r = requests.get(url, headers=headers, timeout=30, verify=verify)
+            r = requests.get(url, headers=headers, timeout=(10, 60), verify=verify)
             r.raise_for_status()
             data = r.json()
             if not isinstance(data, dict if as_dict else list) or not data:
@@ -834,7 +841,10 @@ def _get_json(url: str, as_dict: bool = False):
                     pass
         except Exception as e:  # 網路錯誤、HTTP 錯誤、JSON 解析錯誤
             last_err = e
-        time.sleep(3 * attempt)
+        if attempt < max_attempts:
+            wait = 5 * 2 ** (attempt - 1)
+            print(f"[重試] {url} 第 {attempt} 次失敗（{last_err}），{wait} 秒後重試…", flush=True)
+            time.sleep(wait)
     raise RuntimeError(f"抓取失敗：{url}（{last_err}）")
 
 
@@ -988,7 +998,8 @@ def yf_download(ticker_by_code: Dict[str, str]) -> Dict[str, pd.DataFrame]:
         import yfinance as yf
         raw = yf.download(
             list(ticker_by_code.values()), period="2mo", interval="1d",
-            auto_adjust=False, group_by="ticker", progress=False, threads=True,
+            auto_adjust=False, group_by="ticker", progress=False,
+            threads=False,   # 單執行緒：避免 yfinance 內部快取資料庫 "database is locked" 錯誤
         )
     except Exception as e:
         warn(f"yfinance 下載失敗：{e}")
