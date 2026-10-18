@@ -808,13 +808,12 @@ def warn(msg: str) -> None:
 # 2. 官方資料抓取（證交所＋櫃買中心）
 # ----------------------------------------------------------------------
 
-def _get_json(url: str, as_dict: bool = False):
+def _get_json(url: str, as_dict: bool = False, max_attempts: int = 5):
     """
-    GET JSON，最多重試 5 次（等待 5、10、20、40 秒）；回傳內容必須是非空 list（as_dict=True 時為非空 dict）。
+    GET JSON，預設最多重試 5 次（等待 5、10、20、40 秒）；回傳內容必須是非空 list（as_dict=True 時為非空 dict）。
     官方 API 偶爾會中途斷線（例如 "Response ended prematurely"），所以重試次數與等待時間要夠長；
     第 3 次起改用不壓縮（identity）傳輸，避開壓縮串流被截斷的問題。
     """
-    max_attempts = 5
     verify = True
     last_err: Exception | None = None
     for attempt in range(1, max_attempts + 1):
@@ -1248,6 +1247,373 @@ def build_detail_table(stock_df: pd.DataFrame) -> pd.DataFrame:
     return merged[cols].reset_index(drop=True)
 
 
+# ----------------------------------------------------------------------
+# 8. 籌碼資料：三大法人買賣超、融資融券（長期累積，滾動計算 1／5／10／20／60 日）
+# ----------------------------------------------------------------------
+# 資料來源（皆為官方，依日期查詢，所以可以回補歷史）：
+#   證交所：三大法人買賣超日報 T86、融資融券彙總 MI_MARGN
+#   櫃買中心：三大法人買賣明細、融資融券餘額（網址有新舊兩種格式，依序嘗試）
+# 每次執行把當日資料累積進 output/chips_inst.csv、chips_margin.csv，
+# 再算出各期間的累計數寫到 output/chips_latest.csv（網頁「籌碼」分頁讀它）。
+# 籌碼資料任何一步失敗都只會警告，不影響原本的股價／族群資料更新。
+
+CHIP_PERIODS = (1, 5, 10, 20, 60)
+CHIP_WINDOW_DAYS = 100            # 往前追溯的日曆天數（涵蓋 60 個交易日）
+CHIP_BACKFILL_PER_RUN = 12        # 每次執行最多回補幾個交易日（避免被官網限流、超過 Actions 時限）
+CHIP_REQUEST_GAP = 3.0            # 官網請求間隔（秒）；證交所對連續請求會限流
+CHIP_TIME_BUDGET = 480            # 籌碼更新每次最多花多少秒
+# 主力定義：官方資料沒有券商分點（真正的「主力」需要分點資料，沒有免費官方來源），
+# 這裡以「外資 ＋ 投信」的買賣超作為近似，並在網頁上明確標示。
+MAIN_FORCE_PARTS = ("外資", "投信")
+
+INST_FILE = "chips_inst.csv"
+MARGIN_FILE = "chips_margin.csv"
+CHIP_META_FILE = "chips_meta.json"
+CHIPS_LATEST_FILE = "chips_latest.csv"
+
+TWSE_T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86?date={ymd}&selectType=ALL&response=json"
+TWSE_MARGIN_URL = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date={ymd}&selectType=ALL&response=json"
+TPEX_INST_URLS = [
+    "https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade?type=Daily&sect=AL&date={slash}&id=&response=json",
+    "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&se=EW&t=D&d={roc}&o=json",
+]
+TPEX_MARGIN_URLS = [
+    "https://www.tpex.org.tw/www/zh-tw/margin/balance?date={slash}&id=&response=json",
+    "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?l=zh-tw&o=json&d={roc}&s=0,asc",
+]
+_FOREIGN_NAMES = ["外陸資買賣超股數(不含外資自營商)", "外資及陸資買賣超股數(不含外資自營商)",
+                  "外資買賣超股數", "外陸資買賣超股數"]
+
+
+class NoDataError(Exception):
+    """官方明確回答「沒有符合條件的資料」（休市日，或該日資料尚未公布）。"""
+
+
+def _fmt_date(d: dt.date) -> Dict[str, str]:
+    return {"ymd": d.strftime("%Y%m%d"), "slash": d.strftime("%Y/%m/%d"),
+            "roc": f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"}
+
+
+def _extract_table(j: dict):
+    """從各種回傳格式取出（欄位, 資料列, 日期）：支援 {tables:[…]}、{data:[…]}、{aaData:[…]}。"""
+    cands = []
+    if isinstance(j.get("tables"), list):
+        for tb in j["tables"]:
+            if isinstance(tb, dict) and tb.get("data"):
+                cands.append((tb.get("fields") or [], tb["data"], tb.get("date") or j.get("date")))
+    for key in ("data", "aaData"):
+        if j.get(key):
+            cands.append((j.get("fields") or [], j[key], j.get("date") or j.get("reportDate")))
+    if not cands:
+        return None
+    fields, rows, d = max(cands, key=lambda c: len(c[1]))
+    return [str(f).strip() for f in fields], rows, (_parse_date(d) if d else None)
+
+
+def _parse_inst(fields: List[str], rows: list, market: str) -> pd.DataFrame:
+    """三大法人買賣超（單位：股）。欄位位置會用「外資＋投信＋自營商＝合計」驗證，對不上就拒絕，不存錯資料。"""
+    df = pd.DataFrame(rows)
+
+    def build(i_code, i_f, i_t, i_d, i_total, groups=()):
+        out = pd.DataFrame({"代號": df[i_code].astype(str).str.strip(),
+                            "外資": _to_num(df[i_f]), "投信": _to_num(df[i_t]), "自營商": _to_num(df[i_d])})
+        ok = pd.Series(True, index=out.index)
+        if i_total is not None:       # 外資＋投信＋自營商 ＝ 三大法人合計
+            total = _to_num(df[i_total])
+            ok &= ((out["外資"] + out["投信"] + out["自營商"] - total).abs() <= 1).fillna(False)
+        for ib, isl, inet in groups:  # 每組：買進 － 賣出 ＝ 買賣超（能抓出外資／投信欄位對調）
+            ok &= ((_to_num(df[ib]) - _to_num(df[isl]) - _to_num(df[inet])).abs() <= 1).fillna(False)
+        return out, float(ok.mean())
+
+    if market == "TWSE":
+        def idx(names):
+            return next((fields.index(n) for n in names if n in fields), None)
+        i = (idx(["證券代號"]), idx(_FOREIGN_NAMES), idx(["投信買賣超股數"]),
+             idx(["自營商買賣超股數"]), idx(["三大法人買賣超股數"]))
+        if None in i[:4]:
+            raise RuntimeError(f"證交所 T86 欄位對不上：{fields}")
+        out, rate = build(*i)
+    else:   # 櫃買中心：24 欄固定順序（可能多一個前置的日期欄）
+        best = None
+        for off in (0, 1):
+            if df.shape[1] < 24 + off:
+                continue
+            res = build(0 + off, 4 + off, 13 + off, 22 + off, 23 + off,
+                        groups=[(2 + off, 3 + off, 4 + off), (11 + off, 12 + off, 13 + off), (20 + off, 21 + off, 22 + off)])
+            if best is None or res[1] > best[1]:
+                best = res
+        if best is None:
+            raise RuntimeError(f"櫃買中心三大法人欄數不符：{df.shape[1]}")
+        out, rate = best
+    if rate < 0.95:
+        raise RuntimeError(f"{market} 三大法人欄位驗證失敗（合計吻合率 {rate:.0%}），欄位順序可能改版")
+    return out.dropna(subset=["外資", "投信", "自營商"]).drop_duplicates("代號")
+
+
+def _parse_margin(fields: List[str], rows: list, market: str) -> pd.DataFrame:
+    """融資、融券餘額（單位：張）。以「前日餘額＋增減＝今日餘額」驗證欄位位置。"""
+    df = pd.DataFrame(rows)
+    best = None
+    for off in (0, 1):
+        try:
+            if market == "TWSE":
+                if off or df.shape[1] < 14:
+                    continue
+                c = lambda k: _to_num(df[k])
+                m_ok = (c(5) + c(2) - c(3) - c(4) - c(6)).abs() <= 0.5          # 融資：前日＋買進－賣出－現償
+                s_ok = (c(11) + c(9) - c(8) - c(10) - c(12)).abs() <= 0.5       # 融券：前日＋賣出－回補－現券償還
+                res = (pd.DataFrame({"代號": df[0].astype(str).str.strip(), "融資餘額": c(6), "融券餘額": c(12)}),
+                       float((m_ok & s_ok).fillna(False).mean()))
+            else:
+                if df.shape[1] < 19 + off:
+                    continue
+                c = lambda k: _to_num(df[k + off])
+                m_ok = (c(2) + c(3) - c(4) - c(5) - c(6)).abs() <= 0.5          # 前資＋資買－資賣－現償＝資餘額
+                s_ok = (c(10) + c(11) - c(12) - c(13) - c(14)).abs() <= 0.5     # 前券＋券賣－券買－券償＝券餘額
+                res = (pd.DataFrame({"代號": df[0 + off].astype(str).str.strip(), "融資餘額": c(6), "融券餘額": c(14)}),
+                       float((m_ok & s_ok).fillna(False).mean()))
+        except Exception:
+            continue
+        if best is None or res[1] > best[1]:
+            best = res
+    if best is None:
+        raise RuntimeError(f"{market} 融資融券欄數不符（{df.shape[1]} 欄）")
+    out, rate = best
+    if rate < 0.9:
+        raise RuntimeError(f"{market} 融資融券欄位驗證失敗（吻合率 {rate:.0%}），欄位順序可能改版")
+    return out.dropna(subset=["融資餘額", "融券餘額"]).drop_duplicates("代號")
+
+
+_tpex_bad_urls: set = set()      # 本次執行中已確認失敗的網址，不再重試
+_tpex_last_err: Dict[str, str] = {}
+
+
+def fetch_chip_day(d: dt.date, market: str, kind: str) -> pd.DataFrame:
+    """抓某日某市場的籌碼資料（kind = 'inst' 或 'margin'）。官方說沒資料 → NoDataError；其他問題 → RuntimeError。"""
+    f = _fmt_date(d)
+    parse = _parse_inst if kind == "inst" else _parse_margin
+    if market == "TWSE":
+        url = (TWSE_T86_URL if kind == "inst" else TWSE_MARGIN_URL).format(**f)
+        j = _get_json(url, as_dict=True, max_attempts=3)
+        stat = str(j.get("stat", ""))
+        if "沒有符合條件" in stat:
+            raise NoDataError(stat)
+        if stat.upper() != "OK":
+            raise RuntimeError(f"證交所回應異常：{stat}")
+        tb = _extract_table(j)
+        if tb is None:
+            raise NoDataError("無資料列")
+        fields, rows, rd = tb
+        rd = rd or _parse_date(j.get("date"))
+        if rd is not None and rd != d:
+            raise NoDataError(f"回傳日期 {rd} ≠ 查詢日期 {d}")
+        return parse(fields, rows, market)
+
+    last_err: Optional[Exception] = None
+    saw_empty = False
+    for url_t in (TPEX_INST_URLS if kind == "inst" else TPEX_MARGIN_URLS):
+        if url_t in _tpex_bad_urls:
+            continue
+        try:
+            j = _get_json(url_t.format(**f), as_dict=True, max_attempts=2)
+            tb = _extract_table(j)
+            if tb is None:
+                saw_empty = True                  # 這個格式說沒資料（休市日或尚未公布）
+                continue
+            fields, rows, rd = tb
+            rd = rd or _parse_date(j.get("date") or j.get("reportDate"))
+            if rd is not None and rd != d:
+                saw_empty = True
+                continue
+            return parse(fields, rows, market)
+        except Exception as e:
+            _tpex_bad_urls.add(url_t)
+            last_err = e
+            _tpex_last_err[kind] = str(e)
+    if saw_empty:
+        raise NoDataError("櫃買中心無資料")
+    raise RuntimeError(f"櫃買中心 {kind} 抓取失敗：{last_err or _tpex_last_err.get(kind, '所有網址都已失效')}")
+
+
+# ---------- 累積檔（ledger）與進度記錄 ----------
+
+def _read_ledger(path: str, cols: List[str]) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=cols)
+    df = pd.read_csv(path, dtype={"代號": str}, encoding="utf-8-sig")
+    df["日期"] = pd.to_datetime(df["日期"]).dt.date
+    return df[cols]
+
+
+def _load_meta(path: str) -> dict:
+    import json
+    try:
+        with open(path, encoding="utf-8") as fh:
+            m = json.load(fh)
+    except Exception:
+        m = {}
+    m.setdefault("codes", []); m.setdefault("holidays", []); m.setdefault("pending", [])
+    m.setdefault("done", {}); m["done"].setdefault("inst", []); m["done"].setdefault("margin", [])
+    return m
+
+
+def _save_meta(path: str, meta: dict) -> None:
+    import json
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, ensure_ascii=False, indent=1, sort_keys=True)
+
+
+def update_chips(output_dir: str, codes: List[str], trade_date: dt.date, price_dates: set) -> Optional[pd.DataFrame]:
+    """累積籌碼資料（含回補）並計算各期間累計，輸出 chips_latest.csv。回傳該 DataFrame。"""
+    started = time.time()
+    tracked = sorted(set(codes))
+    tracked_set = set(tracked)
+    inst_path = os.path.join(output_dir, INST_FILE)
+    margin_path = os.path.join(output_dir, MARGIN_FILE)
+    meta_path = os.path.join(output_dir, CHIP_META_FILE)
+    inst_cols = ["日期", "市場", "代號", "外資(股)", "投信(股)", "自營商(股)"]
+    margin_cols = ["日期", "市場", "代號", "融資餘額(張)", "融券餘額(張)"]
+    inst = _read_ledger(inst_path, inst_cols)
+    margin = _read_ledger(margin_path, margin_cols)
+    meta = _load_meta(meta_path)
+    holidays = set(meta["holidays"])
+    done = {k: set(meta["done"][k]) for k in ("inst", "margin")}
+    pending = set(meta["pending"])
+
+    # 追蹤清單有變動（新增／移除個股）：舊資料只存了當時追蹤的代號，需要重新回補才完整
+    if set(meta["codes"]) != tracked_set and meta["codes"]:
+        pending |= {k.split("|")[0] for k in done["inst"] | done["margin"]}
+        print("[籌碼] 追蹤清單有變動，歷史籌碼將分批重新回補")
+    meta["codes"] = tracked
+
+    # 行事曆：往前 CHIP_WINDOW_DAYS 天的平日，扣掉已確認的休市日
+    days = [trade_date - dt.timedelta(days=i) for i in range(CHIP_WINDOW_DAYS + 1)]
+    weekdays = sorted(d for d in days if d.weekday() < 5)
+
+    def key(d, m):
+        return f"{d.isoformat()}|{m}"
+
+    n_fetched = 0
+    fail_streak = 0
+    problems: Dict[str, str] = {}
+    for d in reversed(weekdays):                          # 由新到舊
+        if n_fetched >= CHIP_BACKFILL_PER_RUN or time.time() - started > CHIP_TIME_BUDGET or fail_streak >= 4:
+            break
+        if d.isoformat() in holidays:
+            continue
+        todo = [(k, m) for k in ("inst", "margin") for m in ("TWSE", "TPEX")
+                if key(d, m) not in done[k] or d.isoformat() in pending]
+        if not todo:
+            continue
+        n_fetched += 1
+        is_trading_day = d in price_dates
+        skip_date = False
+        for kind, market in todo:
+            if skip_date or time.time() - started > CHIP_TIME_BUDGET:
+                break
+            time.sleep(CHIP_REQUEST_GAP)
+            try:
+                df = fetch_chip_day(d, market, kind)
+            except NoDataError:
+                if kind == "inst" and market == "TWSE" and not is_trading_day:
+                    holidays.add(d.isoformat()); skip_date = True     # 證交所明確說沒資料、且不是已知交易日 → 休市日
+                fail_streak = 0
+                continue
+            except Exception as e:
+                fail_streak += 1
+                problems[f"{market}-{kind}"] = str(e)[:160]
+                continue
+            fail_streak = 0
+            df = df[df["代號"].isin(tracked_set)].copy()
+            df.insert(0, "市場", market); df.insert(0, "日期", d)
+            if kind == "inst":
+                df = df.rename(columns={"外資": "外資(股)", "投信": "投信(股)", "自營商": "自營商(股)"})[inst_cols]
+                inst = pd.concat([inst[~((inst["日期"] == d) & (inst["市場"] == market))], df], ignore_index=True)
+            else:
+                df = df.rename(columns={"融資餘額": "融資餘額(張)", "融券餘額": "融券餘額(張)"})[margin_cols]
+                margin = pd.concat([margin[~((margin["日期"] == d) & (margin["市場"] == market))], df], ignore_index=True)
+            done[kind].add(key(d, market))
+        if skip_date or all(key(d, m) in done[k] for k in ("inst", "margin") for m in ("TWSE", "TPEX")):
+            pending.discard(d.isoformat())
+    for name, msg in problems.items():
+        warn(f"籌碼資料 {name} 抓取失敗：{msg}")
+
+    # 只保留視窗內的資料
+    cutoff = trade_date - dt.timedelta(days=CHIP_WINDOW_DAYS)
+    inst = inst[inst["日期"] >= cutoff].sort_values(["日期", "市場", "代號"]).reset_index(drop=True)
+    margin = margin[margin["日期"] >= cutoff].sort_values(["日期", "市場", "代號"]).reset_index(drop=True)
+    inst.to_csv(inst_path, index=False, encoding="utf-8-sig")
+    margin.to_csv(margin_path, index=False, encoding="utf-8-sig")
+    meta["holidays"] = sorted(holidays); meta["pending"] = sorted(pending)
+    meta["done"] = {k: sorted(v) for k, v in done.items()}
+    _save_meta(meta_path, meta)
+
+    out = compute_chips_latest(inst, margin, tracked, weekdays, holidays, done)
+    if out is None:
+        print("[籌碼] 目前累積的資料還不足以計算，之後的排程會陸續回補")
+        return None
+    out.to_csv(os.path.join(output_dir, CHIPS_LATEST_FILE), index=False, encoding="utf-8-sig")
+    print(f"[籌碼] 本次回補 {n_fetched} 個交易日，籌碼資料截至 {out['籌碼日期'].iloc[0]}，"
+          f"已輸出 {CHIPS_LATEST_FILE}（{len(out)} 檔）")
+    return out
+
+
+def compute_chips_latest(inst: pd.DataFrame, margin: pd.DataFrame, tracked: List[str],
+                         weekdays: List[dt.date], holidays: set, done: Dict[str, set]) -> Optional[pd.DataFrame]:
+    """依累積資料計算每檔個股各期間的累計買賣超、融資融券餘額與增減。期間內只要有日期尚未取得資料就留空。"""
+    cal_all = [d for d in weekdays if d.isoformat() not in holidays]
+    twse_done = sorted(d for d in cal_all if f"{d.isoformat()}|TWSE" in done["inst"])
+    if not twse_done:
+        return None
+    asof = twse_done[-1]
+    cal = [d for d in cal_all if d <= asof]
+
+    market_of: Dict[str, str] = {}
+    for df in (inst, margin):
+        market_of.update(dict(zip(df["代號"], df["市場"])))
+    inst_map: Dict[str, Dict[dt.date, Tuple[float, float, float]]] = {}
+    for r in inst.itertuples(index=False):
+        inst_map.setdefault(r[2], {})[r[0]] = (float(r[3]), float(r[4]), float(r[5]))
+    margin_map: Dict[str, Dict[dt.date, Tuple[float, float]]] = {}
+    for r in margin.itertuples(index=False):
+        margin_map.setdefault(r[2], {})[r[0]] = (float(r[3]), float(r[4]))
+
+    nan = float("nan")
+    rows = []
+    for code in tracked:
+        mk = market_of.get(code)
+        row: Dict[str, object] = {"代號": code, "籌碼日期": asof}
+        bal = margin_map.get(code, {}).get(asof) if mk else None
+        row["融資餘額(張)"] = bal[0] if bal else nan
+        row["融券餘額(張)"] = bal[1] if bal else nan
+        row["券資比(%)"] = round(bal[1] / bal[0] * 100, 2) if bal and bal[0] > 0 else nan
+        for p in CHIP_PERIODS:
+            win = cal[-p:]
+            ok = bool(mk) and code in inst_map and len(win) == p and all(f"{d.isoformat()}|{mk}" in done["inst"] for d in win)
+            if ok:
+                s = [sum(inst_map[code].get(d, (0.0, 0.0, 0.0))[i] for d in win) / 1000 for i in range(3)]   # 股 → 張
+                f_, t_, d_ = s
+            else:
+                f_ = t_ = d_ = nan
+            row[f"外資_{p}日"], row[f"投信_{p}日"], row[f"自營商_{p}日"] = f_, t_, d_
+            row[f"三大法人_{p}日"] = f_ + t_ + d_
+            row[f"主力_{p}日"] = sum({"外資": f_, "投信": t_, "自營商": d_}[n] for n in MAIN_FORCE_PARTS)
+            win2 = cal[-(p + 1):]
+            mm = margin_map.get(code, {})
+            if mk and len(win2) == p + 1 and win2[0] in mm and win2[-1] in mm \
+                    and f"{win2[0].isoformat()}|{mk}" in done["margin"] and f"{win2[-1].isoformat()}|{mk}" in done["margin"]:
+                row[f"融資增減_{p}日"] = mm[win2[-1]][0] - mm[win2[0]][0]
+                row[f"融券增減_{p}日"] = mm[win2[-1]][1] - mm[win2[0]][1]
+            else:
+                row[f"融資增減_{p}日"] = row[f"融券增減_{p}日"] = nan
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    for c in out.columns:
+        if c not in ("代號", "籌碼日期", "券資比(%)"):
+            out[c] = out[c].round(0).astype("Int64")      # 張數取整數；留空者保持空白
+    return out
+
+
 def _existing_latest_date(output_dir: str) -> Optional[dt.date]:
     """讀現有 stocks_latest.csv 的最新日期（沒有檔案就回傳 None）。"""
     path = os.path.join(output_dir, "stocks_latest.csv")
@@ -1332,7 +1698,14 @@ def run(output_dir: str = OUTPUT_DIR):
 
     # ---- 把今天的官方資料累積進歷史檔 ----
     today_rows = official.rename(columns={"日期": "日期"})[["日期", "代號", "收盤價", "成交金額(元)", "來源"]]
-    trim_history(upsert_history(hist, today_rows)).to_csv(hist_path, index=False, encoding="utf-8-sig")
+    hist_final = trim_history(upsert_history(hist, today_rows))
+    hist_final.to_csv(hist_path, index=False, encoding="utf-8-sig")
+
+    # ---- 籌碼資料（三大法人、融資融券；長期累積）：失敗只警告，不影響上面的股價資料 ----
+    try:
+        update_chips(output_dir, codes, trade_date, set(hist_final["日期"]))
+    except Exception as e:
+        warn(f"籌碼資料更新失敗（股價與族群資料不受影響）：{e}")
 
     n_off = int((official["來源"] == "official").sum())
     print(f"\n交易日：{trade_date}（官方資料 {n_off} 檔、備援 {len(official) - n_off} 檔）")

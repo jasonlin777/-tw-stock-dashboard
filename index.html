@@ -55,6 +55,7 @@
     <div class="inline-flex rounded-lg bg-slate-800 p-1 text-sm">
       <button data-view="overview" class="tab px-4 py-1.5 rounded-md">族群總覽</button>
       <button data-view="stocks" class="tab px-4 py-1.5 rounded-md">個股明細</button>
+      <button data-view="chips" class="tab px-4 py-1.5 rounded-md">籌碼</button>
     </div>
     <div class="inline-flex rounded-lg bg-slate-800 p-1 text-xs items-center">
       <span class="px-2 text-slate-400">當日漲幅</span>
@@ -100,6 +101,24 @@
     </div>
   </section>
 
+  <!-- 籌碼：三大法人、主力、融資融券（可選 1／5／10／20／60 日累計）-->
+  <section id="chipsView" class="space-y-3 hidden">
+    <div id="csec" class="flex gap-2 overflow-x-auto pb-1"></div>
+    <div class="flex flex-wrap items-center gap-3 text-xs text-slate-400">
+      <span>累計期間</span>
+      <div id="pbtns" class="inline-flex rounded-lg bg-slate-800 p-1 text-xs"></div>
+      <span id="chipDate" class="num"></span>
+    </div>
+    <p id="chipHint" class="hidden text-xs text-amber-300/90"></p>
+    <div class="bg-slate-800/60 rounded-xl overflow-x-auto">
+      <table class="w-full min-w-[1080px] text-sm">
+        <thead class="text-slate-400 text-xs"><tr id="chead"></tr></thead>
+        <tbody id="cbody" class="divide-y divide-slate-700/50"></tbody>
+      </table>
+    </div>
+    <p class="text-[11px] text-slate-500 leading-relaxed">單位：張。三大法人＝外資＋投信＋自營商買賣超。<b>主力＝外資＋投信買賣超（近似值）</b>：真正的主力需要券商分點資料，官方沒有免費來源。融資／融券增減＝所選期間內餘額的變化。期間內資料尚未累積完整者顯示「—」。紅＝買超／增加，綠＝賣超／減少。僅供參考，非投資建議。</p>
+  </section>
+
   <footer class="text-[11px] text-slate-500 pb-6">成交金額為收盤價 × 成交股數之近似值，單位：億元。僅供參考，非投資建議。</footer>
 </div>
 
@@ -108,7 +127,7 @@
  * 預設載入的資料網址（相對於 index.html）。載入失敗時自動使用下方示範資料。
  * 若 Python 腳本另存一份固定檔名（如 stocks_latest.csv），就能每天自動更新。 */
 const CONFIG = {
-  DEFAULT_URLS: ["output/stocks_latest.csv", "output/sectors_latest.csv"],
+  DEFAULT_URLS: ["output/stocks_latest.csv", "output/sectors_latest.csv", "output/chips_latest.csv"],
   CHART_SITE: "goodinfo"   // 預設的 K 線圖網站；也可在「個股明細」頁用下拉選單切換（會記住選擇）
 };
 /* 點個股名稱開啟的 K 線圖網站（皆以台股代號查詢，上市／上櫃通用） */
@@ -145,9 +164,11 @@ const SAMPLE = { date: "示範", stocks: [
 ]};
 
 /* ===== 狀態 ===== */
+let savedPeriod = 5;
+try { const v = +localStorage.getItem("chipPeriod"); if ([1, 5, 10, 20, 60].includes(v)) savedPeriod = v; } catch (e) {}
 let savedSite = null;
 try { savedSite = localStorage.getItem("chartSite"); } catch (e) {}
-const S = { data:null, sample:false, view:"overview", filter:null, weighted:false, highlight:null, scrollToHit:false, listFor:null, sort:{key:"pct1d",dir:-1},
+const S = { chips:null, csort:{key:"main", dir:-1}, period:savedPeriod, data:null, sample:false, view:"overview", filter:null, weighted:false, highlight:null, scrollToHit:false, listFor:null, sort:{key:"pct1d",dir:-1},
   chartSite: CHART_SITES[savedSite] ? savedSite : CONFIG.CHART_SITE };
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -187,6 +208,16 @@ function normStock(r) {
     turnoverYi: r["成交金額(億)"] !== undefined ? num(r["成交金額(億)"]) : num(r["成交金額(元)"]) / 1e8,
     sectors: secs };
 }
+const numN = v => { if (v === undefined || v === null || String(v).trim() === "") return null;
+  const x = parseFloat(String(v).replace(/,/g, "")); return Number.isFinite(x) ? x : null; };
+const PERIODS = [1, 5, 10, 20, 60];
+function normChip(r) {
+  const per = {};
+  PERIODS.forEach(p => per[p] = { f: numN(r[`外資_${p}日`]), t: numN(r[`投信_${p}日`]), d: numN(r[`自營商_${p}日`]),
+    total: numN(r[`三大法人_${p}日`]), main: numN(r[`主力_${p}日`]), mc: numN(r[`融資增減_${p}日`]), sc: numN(r[`融券增減_${p}日`]) });
+  return { code: r["代號"], asof: r["籌碼日期"] || "", margin: numN(r["融資餘額(張)"]), short: numN(r["融券餘額(張)"]),
+    ratio: numN(r["券資比(%)"]), per };
+}
 function normSector(r) {
   const k5 = findKey(r, /^近\d+日平均漲幅/);
   return { name: r["族群"], count: num(r["有效檔數"]), avg1d: num(r["當日平均漲幅(%)"]),
@@ -211,14 +242,17 @@ function computeSectors(stocks) {
 
 /* ===== 載入資料 ===== */
 function ingest(texts) {
-  let stocks = null, sectors = null, date = null;
+  let stocks = null, sectors = null, date = null, chips = null;
   for (const t0 of texts) {
     const t = t0.trim();
     if (t.startsWith("{")) { const j = JSON.parse(t); stocks = j.stocks; sectors = j.sectors; date = j.date; continue; }
     const rows = parseCSV(t); if (!rows.length) continue;
+    if ("外資_1日" in rows[0]) { chips = new Map(rows.map(normChip).map(c => [c.code, c])); continue; }
     if ("代號" in rows[0]) stocks = rows.map(normStock);
     else if ("族群" in rows[0]) sectors = rows.map(normSector);
   }
+  if (chips) S.chips = chips;
+  if ((!stocks || !stocks.length) && chips && S.data) return;     // 只匯入籌碼檔：沿用目前的個股資料
   if (!stocks || !stocks.length) throw new Error("找不到個股資料（CSV 需含「代號」欄位）");
   S.data = { date: date || stocks[0].date || "-", stocks, sectors: sectors && sectors.length ? sectors : computeSectors(stocks) };
   S.sample = false; S.filter = null;
@@ -312,6 +346,49 @@ function renderStocks() {
     || `<tr><td colspan="8" class="px-3 py-6 text-center text-slate-500">沒有資料</td></tr>`;
 }
 
+const CCOLS = [["name","代號／名稱"],["pct1d","當日漲跌"],["f","外資"],["t","投信"],["d","自營商"],["total","三大法人"],
+  ["main","主力（外資＋投信）"],["margin","融資餘額"],["mc","融資增減"],["short","融券餘額"],["sc","融券增減"],["ratio","券資比"]];
+const cNum = (v, signed) => v == null ? `<span class="text-slate-600">—</span>`
+  : `<span class="${signed ? col(v) : ""}">${signed && v > 0 ? "+" : ""}${v.toLocaleString("zh-TW")}</span>`;
+function renderChips() {
+  const names = S.data.sectors.map(s => s.name);
+  $("csec").innerHTML = [null, ...names].map(n => `<button data-chip="${n === null ? "" : esc(n)}" class="chip shrink-0 px-3 py-1 rounded-full text-sm ${S.filter === n ? "bg-sky-600" : "bg-slate-800 hover:bg-slate-700"}">${n === null ? "全部" : esc(n)}</button>`).join("");
+  $("pbtns").innerHTML = PERIODS.map(p => `<button data-p="${p}" class="px-3 py-1 rounded-md ${S.period === p ? "bg-sky-600" : "text-slate-300"}">${p === 1 ? "當日" : p + " 日"}</button>`).join("");
+  $("chead").innerHTML = CCOLS.map(([k, t], i) => `<th data-csort="${k}" class="sortable ${i === 0 ? "sticky-col text-left" : "text-right"} px-3 py-2 font-medium whitespace-nowrap">${t}${S.csort.key === k ? (S.csort.dir > 0 ? " ▲" : " ▼") : ""}</th>`).join("");
+  const hint = $("chipHint");
+  if (!S.chips || !S.chips.size) {
+    $("chipDate").textContent = "";
+    hint.textContent = "尚無籌碼資料（output/chips_latest.csv 還沒產生）。腳本更新後，下一次自動更新就會出現。";
+    hint.classList.remove("hidden");
+    $("cbody").innerHTML = `<tr><td colspan="${CCOLS.length}" class="px-3 py-6 text-center text-slate-500">沒有資料</td></tr>`;
+    return;
+  }
+  const asof = [...S.chips.values()][0].asof;
+  $("chipDate").textContent = "籌碼資料截至 " + asof + (asof && S.data.date && asof !== S.data.date ? `（股價資料為 ${S.data.date}）` : "");
+  const uniq = new Map();
+  S.data.stocks.forEach(s => { if (S.filter && !s.sectors.includes(S.filter)) return; if (!uniq.has(s.code)) uniq.set(s.code, s); });
+  const rows = [...uniq.values()].map(s => { const c = S.chips.get(s.code); return { s, c, v: c ? c.per[S.period] : null }; });
+  const val = (r, k) => k === "name" ? r.s.code : k === "pct1d" ? r.s.pct1d
+    : ["margin", "short", "ratio"].includes(k) ? (r.c ? r.c[k] : null) : (r.v ? r.v[k] : null);
+  const { key, dir } = S.csort;
+  rows.sort((a, b) => { const x = val(a, key), y = val(b, key);
+    if (x == null && y == null) return 0; if (x == null) return 1; if (y == null) return -1;   // 空值一律排最後
+    return (x > y ? 1 : x < y ? -1 : 0) * dir; });
+  const have = rows.filter(r => r.v && r.v.total != null).length;
+  hint.textContent = rows.length && !have ? `這個期間（${S.period === 1 ? "當日" : S.period + " 日"}）的歷史籌碼還在累積中，每次自動更新會陸續補齊。可先切換到較短的期間。` : "";
+  hint.classList.toggle("hidden", !hint.textContent);
+  $("cbody").innerHTML = rows.map(r => `<tr class="hover:bg-slate-700/30">
+    <td class="sticky-col px-3 py-2 whitespace-nowrap"><span class="num text-slate-400">${esc(r.s.code)}</span> <a href="${chartUrl(r.s.code)}" target="_blank" rel="noopener noreferrer" class="font-medium text-sky-300 hover:underline">${esc(r.s.name)}</a></td>
+    <td class="num text-right px-3 py-2 ${col(r.s.pct1d)}">${pct(r.s.pct1d)}</td>
+    ${["f","t","d","total","main"].map(k => `<td class="num text-right px-3 py-2">${cNum(r.v ? r.v[k] : null, true)}</td>`).join("")}
+    <td class="num text-right px-3 py-2">${cNum(r.c ? r.c.margin : null, false)}</td>
+    <td class="num text-right px-3 py-2">${cNum(r.v ? r.v.mc : null, true)}</td>
+    <td class="num text-right px-3 py-2">${cNum(r.c ? r.c.short : null, false)}</td>
+    <td class="num text-right px-3 py-2">${cNum(r.v ? r.v.sc : null, true)}</td>
+    <td class="num text-right px-3 py-2">${r.c && r.c.ratio != null ? r.c.ratio.toFixed(2) + "%" : cNum(null, false)}</td></tr>`).join("")
+    || `<tr><td colspan="${CCOLS.length}" class="px-3 py-6 text-center text-slate-500">沒有資料</td></tr>`;
+}
+
 function render() {
   $("date").textContent = S.data.date;
   $("badge").classList.toggle("hidden", !S.sample);
@@ -319,7 +396,8 @@ function render() {
   document.querySelectorAll(".wbtn").forEach(b => b.className = "wbtn px-3 py-1 rounded-md " + ((b.dataset.w === "1") === S.weighted ? "bg-sky-600" : "text-slate-300"));
   $("overview").classList.toggle("hidden", S.view !== "overview");
   $("stocks").classList.toggle("hidden", S.view !== "stocks");
-  renderCards(); renderStocks(); renderCharts();
+  $("chipsView").classList.toggle("hidden", S.view !== "chips");
+  renderCards(); renderStocks(); renderCharts(); renderChips();
   if (S.listFor !== S.data) {   // 資料更新時重建「代號＋名稱」建議清單
     const seen = new Map(); S.data.stocks.forEach(x => seen.set(x.code, x.name));
     $("stockList").innerHTML = [...seen].map(([c, n]) => `<option value="${esc(c)} ${esc(n)}">`).join("");
@@ -334,12 +412,14 @@ function pick(name) { S.filter = name || null; S.highlight = null; $("q").value 
 
 /* ===== 事件 ===== */
 document.addEventListener("click", e => {
-  const t = e.target.closest("[data-view],[data-w],[data-sector],[data-chip],[data-sort],[data-clear]"); if (!t) return;
+  const t = e.target.closest("[data-view],[data-w],[data-sector],[data-chip],[data-sort],[data-clear],[data-p],[data-csort]"); if (!t) return;
   if (t.dataset.view) { S.view = t.dataset.view; render(); }
   else if (t.dataset.w) { S.weighted = t.dataset.w === "1"; render(); }
   else if (t.dataset.sector) pick(t.dataset.sector);
   else if (t.dataset.chip !== undefined) { S.filter = t.dataset.chip || null; S.scrollToHit = !!S.highlight; render(); }
   else if (t.dataset.clear) { S.highlight = null; $("q").value = ""; render(); }
+  else if (t.dataset.p) { S.period = +t.dataset.p; try { localStorage.setItem("chipPeriod", S.period); } catch (err) {} renderChips(); }
+  else if (t.dataset.csort) { const k = t.dataset.csort; S.csort = { key:k, dir: S.csort.key === k ? -S.csort.dir : -1 }; renderChips(); }
   else if (t.dataset.sort) { const k = t.dataset.sort; S.sort = { key:k, dir: S.sort.key === k ? -S.sort.dir : -1 }; renderStocks(); }
 });
 $("toggleUrl").onclick = () => $("urlBox").classList.toggle("hidden");
