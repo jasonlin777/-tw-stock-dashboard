@@ -1514,9 +1514,11 @@ def update_chips(output_dir: str, codes: List[str], trade_date: dt.date, price_d
             time.sleep(CHIP_REQUEST_GAP)
             try:
                 df = fetch_chip_day(d, market, kind)
-            except NoDataError:
+            except NoDataError as e:
                 if kind == "inst" and market == "TWSE" and not is_trading_day:
                     holidays.add(d.isoformat()); skip_date = True     # 證交所明確說沒資料、且不是已知交易日 → 休市日
+                elif is_trading_day:                                   # 明明是交易日卻說沒資料：可能尚未公布，或網址／格式有問題
+                    problems[f"{market}-{kind}"] = f"{d} 是交易日，但官方回應沒有資料（{e}）"
                 fail_streak = 0
                 continue
             except Exception as e:
@@ -1548,6 +1550,9 @@ def update_chips(output_dir: str, codes: List[str], trade_date: dt.date, price_d
     meta["done"] = {k: sorted(v) for k, v in done.items()}
     _save_meta(meta_path, meta)
 
+    cnt = {(k, m): sum(1 for x in done[k] if x.endswith("|" + m)) for k in ("inst", "margin") for m in ("TWSE", "TPEX")}
+    print(f"[籌碼] 已累積天數：三大法人 上市 {cnt[('inst', 'TWSE')]}／上櫃 {cnt[('inst', 'TPEX')]}，"
+          f"融資融券 上市 {cnt[('margin', 'TWSE')]}／上櫃 {cnt[('margin', 'TPEX')]}")
     out = compute_chips_latest(inst, margin, tracked, weekdays, holidays, done)
     if out is None:
         print("[籌碼] 目前累積的資料還不足以計算，之後的排程會陸續回補")
