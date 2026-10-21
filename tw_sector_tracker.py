@@ -1296,6 +1296,7 @@ def build_stock_table(official: pd.DataFrame, hist: pd.DataFrame,
             f"近{N_DAYS}日漲跌幅(%)": round((close / base - 1) * 100, 2),
             "成交金額(元)": turnover,
             "成交金額(億)": round(turnover / YI, 2),
+            "市場": r["市場"],                         # TWSE＝上市、TPEX＝上櫃（網頁開 TradingView 圖表用）
         })
 
     if no_hist:
@@ -1381,7 +1382,7 @@ def build_detail_table(stock_df: pd.DataFrame) -> pd.DataFrame:
     })
     merged = members.merge(stock_df.drop(columns=["名稱"]), on="代號", how="inner")
     cols = ["族群", "代號", "名稱", "產業分類", "說明", "日期", "收盤價",
-            "當日漲跌幅(%)", f"近{N_DAYS}日漲跌幅(%)", "成交金額(億)", "成交金額(元)"]
+            "當日漲跌幅(%)", f"近{N_DAYS}日漲跌幅(%)", "成交金額(億)", "成交金額(元)", "市場"]
     return merged[cols].reset_index(drop=True)
 
 
