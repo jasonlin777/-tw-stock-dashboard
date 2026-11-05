@@ -1378,23 +1378,33 @@ def trim_history(hist: pd.DataFrame) -> pd.DataFrame:
     return hist[hist["日期"].isin(keep)].sort_values(["日期", "代號"]).reset_index(drop=True)
 
 
-def expected_prior_dates(hist: pd.DataFrame, trade_date: dt.date) -> List[dt.date]:
+def _closed_dates(output_dir: str) -> set:
+    """籌碼流程已確認的休市日（含颱風假）。價格歷史若有這些日期的資料就是假的，要排除。"""
+    try:
+        meta = _load_meta(os.path.join(output_dir, CHIP_META_FILE))
+        return {dt.date.fromisoformat(x) for x in meta.get("holidays", [])}
+    except Exception:
+        return set()
+
+
+def expected_prior_dates(hist: pd.DataFrame, trade_date: dt.date, closed: frozenset = frozenset()) -> List[dt.date]:
     """交易日當天之前的最近 N_DAYS 個交易日：以 2330 的日線當交易日曆，抓不到才用本地歷史推算。"""
     cal = yf_download({"2330": "2330.TW"}).get("2330")
     if cal is not None:
-        dates = sorted({ts.date() for ts in cal.index if ts.date() < trade_date})
+        dates = sorted({ts.date() for ts in cal.index if ts.date() < trade_date and ts.date() not in closed})
         if len(dates) >= N_DAYS:
             return dates[-N_DAYS:]
     warn("無法由 yfinance 取得交易日曆，改以本地歷史檔推算")
-    return sorted(d for d in hist["日期"].unique() if d < trade_date)[-N_DAYS:]
+    return sorted(d for d in hist["日期"].unique() if d < trade_date and d not in closed)[-N_DAYS:]
 
 
-def ensure_history(hist: pd.DataFrame, official: pd.DataFrame, trade_date: dt.date) -> pd.DataFrame:
+def ensure_history(hist: pd.DataFrame, official: pd.DataFrame, trade_date: dt.date,
+                   closed: frozenset = frozenset()) -> pd.DataFrame:
     """
     確認每檔股票都有「交易日前最近 N_DAYS 個交易日」的收盤價；
     缺的（第一次執行、或排程漏跑幾天）才用 yfinance 回補。
     """
-    expected = expected_prior_dates(hist, trade_date)
+    expected = expected_prior_dates(hist, trade_date, closed)
     prior = hist[hist["日期"] < trade_date]
     n_prior = prior.groupby("代號").size()
     n_expected = prior[prior["日期"].isin(expected)].groupby("代號")["日期"].nunique()
@@ -1839,6 +1849,8 @@ def update_chips(output_dir: str, codes: List[str], trade_date: dt.date, price_d
         n_fetched += 1
         is_trading_day = d in price_dates
         skip_date = False
+        statuses: Dict[Tuple[str, str], str] = {}
+        date_problems: Dict[str, str] = {}
         for kind, market in todo:
             if skip_date or time.time() - started > CHIP_TIME_BUDGET:
                 break
@@ -1846,13 +1858,15 @@ def update_chips(output_dir: str, codes: List[str], trade_date: dt.date, price_d
             try:
                 df = fetch_chip_day(d, market, kind)
             except NoDataError as e:
+                statuses[(kind, market)] = "nodata"
                 if kind == "inst" and market == "TWSE" and not is_trading_day:
                     holidays.add(d.isoformat()); skip_date = True     # 證交所明確說沒資料、且不是已知交易日 → 休市日
-                elif is_trading_day:                                   # 明明是交易日卻說沒資料：可能尚未公布，或網址／格式有問題
-                    problems[f"{market}-{kind}"] = f"{d} 是交易日，但官方回應沒有資料（{e}）"
+                elif is_trading_day:                                   # 價格資料說是交易日卻沒籌碼：可能尚未公布，也可能是價格歷史有誤
+                    date_problems[f"{market}-{kind}"] = f"{d} 被視為交易日，但官方回應沒有資料（{e}）"
                 fail_streak = 0
                 continue
             except Exception as e:
+                statuses[(kind, market)] = "error"
                 fail_streak += 1
                 problems[f"{market}-{kind}"] = str(e)[:160]
                 continue
@@ -1866,6 +1880,14 @@ def update_chips(output_dir: str, codes: List[str], trade_date: dt.date, price_d
                 df = df.rename(columns={"融資餘額": "融資餘額(張)", "融券餘額": "融券餘額(張)"})[margin_cols]
                 margin = pd.concat([margin[~((margin["日期"] == d) & (margin["市場"] == market))], df], ignore_index=True)
             done[kind].add(key(d, market))
+        # 證交所與櫃買中心的三大法人都明確回報「沒有資料」，而且不是最近 2 天（還沒公布的可能）→ 休市日。
+        # 例：颱風假全日休市。價格歷史若被補了一筆假資料，單靠價格日期會誤判成交易日。
+        if (not skip_date and statuses.get(("inst", "TWSE")) == "nodata" and statuses.get(("inst", "TPEX")) == "nodata"
+                and d < trade_date - dt.timedelta(days=2)):
+            holidays.add(d.isoformat()); skip_date = True
+            date_problems.clear()
+            print(f"[籌碼] {d} 證交所與櫃買中心都回報沒有資料，視為休市日（例如颱風假）")
+        problems.update(date_problems)
         if skip_date or all(key(d, m) in done[k] for k in ("inst", "margin") for m in ("TWSE", "TPEX")):
             pending.discard(d.isoformat())
     for name, msg in problems.items():
@@ -2011,7 +2033,10 @@ def run(output_dir: str = OUTPUT_DIR):
     # ---- 歷史收盤（累積檔＋必要時回補）----
     os.makedirs(output_dir, exist_ok=True)
     hist_path = os.path.join(output_dir, HISTORY_FILE)
-    hist = ensure_history(load_history(hist_path), official, trade_date)
+    closed = frozenset(_closed_dates(output_dir))
+    hist0 = load_history(hist_path)
+    hist0 = hist0[~hist0["日期"].isin(closed)]            # 休市日（颱風假等）不該有價格資料，排除
+    hist = ensure_history(hist0, official, trade_date, closed)
 
     # ---- 個股、族群指標 ----
     stock_df = build_stock_table(official, hist, names, trade_date)
@@ -2035,13 +2060,15 @@ def run(output_dir: str = OUTPUT_DIR):
     # ---- 把今天的官方資料累積進歷史檔 ----
     today_rows = official.rename(columns={"日期": "日期"})[["日期", "代號", "收盤價", "成交金額(元)", "來源"]]
     hist_final = trim_history(upsert_history(hist, today_rows))
-    hist_final.to_csv(hist_path, index=False, encoding="utf-8-sig")
 
     # ---- 籌碼資料（三大法人、融資融券；長期累積）：失敗只警告，不影響上面的股價資料 ----
     try:
         update_chips(output_dir, codes, trade_date, set(hist_final["日期"]))
     except Exception as e:
         warn(f"籌碼資料更新失敗（股價與族群資料不受影響）：{e}")
+    # 籌碼流程剛確認的休市日也要從價格歷史排除，再存檔
+    hist_final = hist_final[~hist_final["日期"].isin(_closed_dates(output_dir))]
+    hist_final.to_csv(hist_path, index=False, encoding="utf-8-sig")
 
     n_off = int((official["來源"] == "official").sum())
     print(f"\n交易日：{trade_date}（官方資料 {n_off} 檔、備援 {len(official) - n_off} 檔）")
