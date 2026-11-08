@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
 import os
 import re
 import sys
@@ -1988,34 +1989,41 @@ def compute_chips_latest(inst: pd.DataFrame, margin: pd.DataFrame, tracked: List
 #   歷史配息、年報酬（含息）：yfinance（未還原收盤價＋還原股價，後者已含股息）
 # 每一項都獨立處理，任何一項失敗只會留空白並警告，不影響股價與族群資料。
 
-# (代號, 名稱, 主分類, 標籤, 配息月份, 發行投信)；配息月份依你的自選清單分組，空白＝尚未分組
-ETF_DETAIL: List[Tuple[str, str, str, str, str, str]] = [
-    ("0050", "元大台灣50", "市值型", "", "", "元大"),
-    ("006208", "富邦台50", "市值型", "", "", "富邦"),
-    ("009816", "凱基台灣TOP50", "市值型", "", "", "凱基"),
-    ("00923", "群益台ESG低碳50", "市值型", "ESG", "", "群益"),
-    ("00850", "元大臺灣ESG永續", "市值型", "ESG", "2/5/8/11", "元大"),
-    ("0056", "元大高股息", "高股息／收益型", "", "1/4/7/10", "元大"),
-    ("00878", "國泰永續高股息", "高股息／收益型", "ESG", "2/5/8/11", "國泰"),
-    ("00919", "群益台灣精選高息", "高股息／收益型", "", "3/6/9/12", "群益"),
-    ("00900", "富邦特選高股息30", "高股息／收益型", "", "", "富邦"),
-    ("00918", "大華優利高填息30", "高股息／收益型", "", "3/6/9/12", "大華"),
-    ("00713", "元大台灣高息低波", "高股息／收益型", "", "3/6/9/12", "元大"),
-    ("00929", "復華台灣科技優息", "高股息／收益型", "科技", "", "復華"),
-    ("00927", "群益半導體收益", "高股息／收益型", "半導體", "1/4/7/10", "群益"),
-    ("0052", "富邦科技", "科技／半導體主題", "", "", "富邦"),
-    ("00904", "新光臺灣半導體30", "科技／半導體主題", "", "1/4/7/10", "新光"),
-    ("00891", "中信關鍵半導體", "科技／半導體主題", "", "2/5/8/11", "中信"),
-    ("00981A", "主動統一台股增長", "主動式", "", "3/6/9/12", "統一"),
-    ("00403A", "主動統一升級50", "主動式", "", "", "統一"),
+# (代號, 名稱, 主分類, 標籤, 配息月份, 發行投信, 說明)
+# 配息月份依你的自選清單分組，空白＝尚未分組。說明：0056、00878、00919、00929 的指數與選股規則已對照公開資料查證，
+# 其餘為依名稱與發行投信整理的概要，請你確認或直接改這裡的文字。
+ETF_DETAIL: List[Tuple[str, str, str, str, str, str, str]] = [
+    ("0050", "元大台灣50", "市值型", "", "", "元大", "追蹤臺灣50指數（台灣上市公司市值前 50 大）；台灣第一檔 ETF（2003 年掛牌）"),
+    ("006208", "富邦台50", "市值型", "", "", "富邦", "同樣追蹤臺灣50指數，與 0050 投資標的相近，富邦投信發行"),
+    ("009816", "凱基台灣TOP50", "市值型", "", "", "凱基", "凱基投信的台灣大型股市值型 ETF（TOP50）"),
+    ("00923", "群益台ESG低碳50", "市值型", "ESG", "", "群益", "投資符合 ESG 與低碳條件的台灣大型股（50 檔），群益投信發行"),
+    ("00850", "元大臺灣ESG永續", "市值型", "ESG", "2/5/8/11", "元大", "追蹤臺灣 ESG 永續指數，投資 ESG 表現較佳的台灣大型股"),
+    ("0056", "元大高股息", "高股息／收益型", "", "1/4/7/10", "元大", "追蹤臺灣高股息指數：市值前 150 大中，預測未來一年現金殖利率最高的 50 檔；每年 6、12 月調整成分股；季配；經理費 0.30%"),
+    ("00878", "國泰永續高股息", "高股息／收益型", "ESG", "2/5/8/11", "國泰", "追蹤 MSCI 台灣 ESG 永續高股息精選 30 指數：先做 ESG 篩選再選高股息；季配"),
+    ("00919", "群益台灣精選高息", "高股息／收益型", "", "3/6/9/12", "群益", "追蹤臺灣精選高息指數：市值前 300 大、日均成交額高於 8,000 萬、近四季 ROE 為正，選高股利率 30 檔；5 月底、12 月換股；季配；經理費 0.30%"),
+    ("00900", "富邦特選高股息30", "高股息／收益型", "", "", "富邦", "富邦投信的高股息 ETF，成分股 30 檔"),
+    ("00918", "大華優利高填息30", "高股息／收益型", "", "3/6/9/12", "大華", "大華投信的高股息 ETF，選股兼顧殖利率與填息能力，成分股 30 檔"),
+    ("00713", "元大台灣高息低波", "高股息／收益型", "", "3/6/9/12", "元大", "元大投信的高息低波 ETF：高股息且低波動的台股，偏防禦型"),
+    ("00929", "復華台灣科技優息", "高股息／收益型", "科技", "月配", "復華", "追蹤臺灣上市上櫃科技優息指數：結合科技產業與股息，科技類股權重很高（約 95%，隨指數調整）；全台首檔月配息股票型 ETF"),
+    ("00927", "群益半導體收益", "高股息／收益型", "半導體", "1/4/7/10", "群益", "群益投信的半導體收益型 ETF：投資半導體族群中配息能力較佳的股票"),
+    ("0052", "富邦科技", "科技／半導體主題", "", "", "富邦", "投資台灣資訊科技類股（半導體、電子為主）的科技型 ETF，富邦投信發行"),
+    ("00904", "新光臺灣半導體30", "科技／半導體主題", "", "1/4/7/10", "新光", "新光投信的台灣半導體 ETF，成分股 30 檔"),
+    ("00891", "中信關鍵半導體", "科技／半導體主題", "", "2/5/8/11", "中信", "中信投信的關鍵半導體 ETF：投資台灣半導體產業鏈（設計、製造、封測、設備）的關鍵公司"),
+    ("00981A", "主動統一台股增長", "主動式", "", "3/6/9/12", "統一", "統一投信的主動式 ETF，經理人主動選股、偏重成長；主動式 ETF 每日公開持股"),
+    ("00403A", "主動統一升級50", "主動式", "", "", "統一", "統一投信的主動式 ETF，由經理人主動挑選台股"),
 ]
 ETF_CODES = [e[0] for e in ETF_DETAIL]
 ETF_LATEST_FILE = "etf_latest.csv"
 MIS_ETF_URL = "https://mis.twse.com.tw/stock/data/all_etf.txt"
 TWSE_ETF_DIV_URL = "https://www.twse.com.tw/rwd/zh/ETF/etfDiv?startDate={start}&endDate={end}&response=json"
-ETF_COLS = ["代號", "名稱", "分類", "標籤", "配息月份", "發行投信", "日期", "收盤價", "當日漲跌幅(%)", "成交金額(億)",
+ETF_COLS = ["代號", "名稱", "分類", "標籤", "配息月份", "發行投信", "說明", "日期", "收盤價", "當日漲跌幅(%)", "成交金額(億)",
             "規模(億)", "折溢價(%)", "近四季配息(元)", "近四季殖利率(%)", "年報酬含息(%)",
-            "除息狀態", "除息日", "最後買進日", "發放日", "配息金額(元)", "單次殖利率(%)", "市場"]
+            "除息狀態", "除息日", "最後買進日", "發放日", "配息金額(元)", "單次殖利率(%)",
+            "受益人數", "持有人_不足1張(%)", "持有人_1~5張(%)", "持有人_5~10張(%)", "持有人_10~50張(%)", "持有人_50張以上(%)",
+            "千張大戶持股比(%)", "持有人資料日期", "受益人數週增減", "小額持有人占比週變化(pp)", "市場"]
+ETF_DIV_FILE = "etf_dividends.csv"
+ETF_HOLDERS_FILE = "etf_holders.csv"
+TDCC_URL = "https://smart.tdcc.com.tw/opendata/getOD.ashx?id=1-5"
 
 
 def _num1(v) -> Optional[float]:
@@ -2123,12 +2131,25 @@ def _etf_quotes(trade_date: dt.date) -> Dict[str, dict]:
     return rows
 
 
+def _mis_items(obj):
+    """遞迴找出所有 ETF 紀錄（有 a 代號、b 名稱、c 發行單位數）。證交所彙整各投信的回應，可能是巢狀結構。"""
+    if isinstance(obj, dict):
+        if all(k in obj for k in ("a", "b", "c")) and not isinstance(obj["a"], (list, dict)):
+            yield obj
+        for v in obj.values():
+            yield from _mis_items(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _mis_items(v)
+
+
 def fetch_etf_scale(quotes: Dict[str, dict]) -> Dict[str, dict]:
     """證交所 MIS：發行單位數 c、前一營業日淨值 h、預估淨值 f、折溢價 g。規模(億)＝單位數 × 前日淨值。
     單位數的單位（千或個別單位）用「規模是否落在合理範圍」自動判斷。"""
     j = _get_json(MIS_ETF_URL, as_dict=True, max_attempts=3)
+    items = list(_mis_items(j))
     recs: Dict[str, dict] = {}
-    for it in j.get("msgArray") or []:
+    for it in items:
         code = str(it.get("a", "")).strip()
         if code not in ETF_CODES:
             continue
@@ -2136,7 +2157,8 @@ def fetch_etf_scale(quotes: Dict[str, dict]) -> Dict[str, dict]:
         if units and nav:
             recs[code] = {"units": units, "nav": nav, "prem": _num1(it.get("g"))}
     if not recs:
-        raise RuntimeError("證交所 ETF 淨值揭露沒有我們追蹤的 ETF")
+        sample = [str(i.get("a")) for i in items[:5]]
+        raise RuntimeError(f"證交所 ETF 淨值揭露找不到我們追蹤的 ETF（回應頂層欄位 {list(j)[:6]}，解析到 {len(items)} 筆，前幾筆代號 {sample}）")
     chosen = None
     for mult in (1000, 1):
         aums = sorted(r["units"] * mult * r["nav"] / 1e8 for r in recs.values())
@@ -2185,6 +2207,86 @@ def fetch_etf_calendar(trade_date: dt.date) -> Dict[str, List[dict]]:
     return out
 
 
+def _get_text(url: str, max_attempts: int = 3) -> str:
+    """GET 純文字（CSV）；先用 GET，失敗再試 POST（集保的下載網址兩種都有人用）。"""
+    headers = {"User-Agent": "Mozilla/5.0 (tw-stock-dashboard)"}
+    last: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        for method in (requests.get, requests.post):
+            try:
+                r = method(url, headers=headers, timeout=(10, 120))
+                r.raise_for_status()
+                r.encoding = "utf-8"
+                txt = r.text.lstrip("\ufeff")
+                if not txt.strip():
+                    raise ValueError("回傳內容為空")
+                return txt
+            except Exception as e:
+                last = e
+        if attempt < max_attempts:
+            time.sleep(5 * attempt)
+    raise RuntimeError(f"抓取失敗：{url}（{last}）")
+
+
+def fetch_etf_holders() -> Tuple[Optional[dt.date], Dict[str, dict]]:
+    """
+    集保戶股權分散表（每週，全部證券的 CSV）→ 我們追蹤的 ETF 的持有人分級。
+    級距依「人數占比」分成 5 組：不足 1 張（1～999 股）、1～5 張、5～10 張、10～50 張、50 張以上，
+    並算出千張大戶（持股 1,000,001 股以上）占集保庫存的比例。
+    """
+    text = _get_text(TDCC_URL)
+    df = pd.read_csv(io.StringIO(text), dtype=str)
+    df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
+
+    def col(*keys):
+        for c in df.columns:
+            if any(k in c for k in keys):
+                return c
+        raise RuntimeError(f"集保股權分散表找不到欄位 {keys}，實際欄位：{list(df.columns)}")
+    c_date, c_code, c_lv, c_ppl, c_pct = col("資料日期"), col("證券代號"), col("持股分級"), col("人數"), col("比例")
+    df[c_code] = df[c_code].astype(str).str.strip()
+    df = df[df[c_code].isin(ETF_CODES)]
+    out: Dict[str, dict] = {}
+    data_date: Optional[dt.date] = None
+    for code, g in df.groupby(c_code):
+        lv = {}
+        for r in g.to_dict("records"):
+            try:
+                lv[int(str(r[c_lv]).strip())] = (float(_to_num(pd.Series([r[c_ppl]])).iloc[0]), float(_to_num(pd.Series([r[c_pct]])).iloc[0]))
+            except (ValueError, TypeError):
+                continue
+        if not all(i in lv for i in range(1, 16)):
+            continue
+        total = sum(lv[i][0] for i in range(1, 16))
+        if total <= 0:
+            continue
+        if 17 in lv and abs(lv[17][0] - total) > max(2.0, total * 0.001):
+            raise RuntimeError(f"{code} 的人數合計與各級距加總對不上（{lv[17][0]:.0f} vs {total:.0f}），集保檔案格式可能改版")
+        share = lambda lvls: sum(lv[i][0] for i in lvls) / total * 100
+        out[code] = {"holders": int(total), "b1": share([1]), "b2": share([2]), "b3": share([3]),
+                     "b4": share(range(4, 9)), "b5": share(range(9, 16)), "whale": lv[15][1]}
+        data_date = data_date or _parse_date(g[c_date].iloc[0])
+    if not out:
+        raise RuntimeError("集保股權分散表裡找不到我們追蹤的 ETF（或級距不完整）")
+    return data_date, out
+
+
+HOLDER_COLS = ["資料日期", "代號", "受益人數", "不足1張", "1~5張", "5~10張", "10~50張", "50張以上", "千張大戶持股比"]
+
+
+def update_holder_history(path: str, data_date: dt.date, holders: Dict[str, dict]) -> pd.DataFrame:
+    """把本週的持有人分級累積進 output/etf_holders.csv（集保只提供當週資料），保留最近 60 週。"""
+    old = pd.read_csv(path, dtype={"代號": str}, encoding="utf-8-sig") if os.path.exists(path) else pd.DataFrame(columns=HOLDER_COLS)
+    new = pd.DataFrame([{"資料日期": data_date.isoformat(), "代號": c, "受益人數": h["holders"], "不足1張": round(h["b1"], 2),
+                         "1~5張": round(h["b2"], 2), "5~10張": round(h["b3"], 2), "10~50張": round(h["b4"], 2),
+                         "50張以上": round(h["b5"], 2), "千張大戶持股比": round(h["whale"], 2)} for c, h in holders.items()])
+    allh = pd.concat([old, new], ignore_index=True).drop_duplicates(["資料日期", "代號"], keep="last")
+    keep = sorted(allh["資料日期"].unique())[-60:]
+    allh = allh[allh["資料日期"].isin(keep)].sort_values(["資料日期", "代號"]).reset_index(drop=True)
+    allh.to_csv(path, index=False, encoding="utf-8-sig")
+    return allh
+
+
 def update_etf(output_dir: str, trade_date: dt.date) -> Optional[pd.DataFrame]:
     """組出 ETF 分頁的資料表（etf_latest.csv）。各資料來源獨立，失敗只留空白。"""
     closed = _closed_dates(output_dir)
@@ -2199,10 +2301,23 @@ def update_etf(output_dir: str, trade_date: dt.date) -> Optional[pd.DataFrame]:
         cal = fetch_etf_calendar(trade_date)
     except Exception as e:
         warn(f"ETF 除息預告取得失敗（改顯示已除息的最近一次）：{str(e)[:150]}"); cal = {}
+    holders: Dict[str, dict] = {}
+    holder_prev: Dict[str, dict] = {}
+    holder_date: Optional[dt.date] = None
+    try:
+        holder_date, holders = fetch_etf_holders()
+        if holder_date:
+            hist_h = update_holder_history(os.path.join(output_dir, ETF_HOLDERS_FILE), holder_date, holders)
+            earlier = hist_h[hist_h["資料日期"] < (holder_date - dt.timedelta(days=3)).isoformat()]
+            for code, g in earlier.groupby("代號"):
+                holder_prev[code] = g.sort_values("資料日期").iloc[-1].to_dict()
+    except Exception as e:
+        warn(f"ETF 持有人分級（集保）取得失敗：{str(e)[:150]}")
 
     rows = []
-    for code, name, cat, tags, grp, issuer in ETF_DETAIL:
+    for code, name, cat, tags, grp, issuer, desc in ETF_DETAIL:
         q, m, s = quotes.get(code), metrics.get(code, {}), scale.get(code, {})
+        hd, hp = holders.get(code), holder_prev.get(code)
         close = q["收盤價"] if q else m.get("收盤價")
         date = trade_date if q else m.get("日期")
         pct = None
@@ -2210,7 +2325,7 @@ def update_etf(output_dir: str, trade_date: dt.date) -> Optional[pd.DataFrame]:
             pct = q["漲跌"] / (close - q["漲跌"]) * 100
         elif close and m.get("前收") and (q is None or m.get("日期") == trade_date):
             pct = (close / m["前收"] - 1) * 100
-        row = {"代號": code, "名稱": name, "分類": cat, "標籤": tags, "配息月份": grp, "發行投信": issuer,
+        row = {"代號": code, "名稱": name, "分類": cat, "標籤": tags, "配息月份": grp, "發行投信": issuer, "說明": desc,
                "日期": date.isoformat() if date else "", "收盤價": close,
                "當日漲跌幅(%)": pct,
                "成交金額(億)": (q["成交金額(元)"] / 1e8 if q and pd.notna(q.get("成交金額(元)")) else None),
@@ -2219,6 +2334,13 @@ def update_etf(output_dir: str, trade_date: dt.date) -> Optional[pd.DataFrame]:
                "近四季殖利率(%)": (m["ttm"] / close * 100 if m.get("ttm") is not None and close else None),
                "年報酬含息(%)": (m["ret1y"] * 100 if m.get("ret1y") is not None else None),
                "除息狀態": "", "除息日": "", "最後買進日": "", "發放日": "", "配息金額(元)": None, "單次殖利率(%)": None,
+               "受益人數": hd["holders"] if hd else None,
+               "持有人_不足1張(%)": hd["b1"] if hd else None, "持有人_1~5張(%)": hd["b2"] if hd else None,
+               "持有人_5~10張(%)": hd["b3"] if hd else None, "持有人_10~50張(%)": hd["b4"] if hd else None,
+               "持有人_50張以上(%)": hd["b5"] if hd else None, "千張大戶持股比(%)": hd["whale"] if hd else None,
+               "持有人資料日期": holder_date.isoformat() if hd and holder_date else "",
+               "受益人數週增減": (hd["holders"] - int(hp["受益人數"])) if hd and hp else None,
+               "小額持有人占比週變化(pp)": ((hd["b1"] + hd["b2"]) - (float(hp["不足1張"]) + float(hp["1~5張"]))) if hd and hp else None,
                "市場": (q.get("市場") if q else "TWSE")}
         nxt = (cal.get(code) or [None])[0]
         if nxt:                                           # 有預告：顯示下一次除息
@@ -2234,10 +2356,32 @@ def update_etf(output_dir: str, trade_date: dt.date) -> Optional[pd.DataFrame]:
         rows.append(row)
     out = pd.DataFrame(rows)[ETF_COLS]
     for c in ["收盤價", "當日漲跌幅(%)", "成交金額(億)", "規模(億)", "折溢價(%)", "近四季配息(元)",
-              "近四季殖利率(%)", "年報酬含息(%)", "配息金額(元)", "單次殖利率(%)"]:
+              "近四季殖利率(%)", "年報酬含息(%)", "配息金額(元)", "單次殖利率(%)", "持有人_不足1張(%)", "持有人_1~5張(%)",
+              "持有人_5~10張(%)", "持有人_10~50張(%)", "持有人_50張以上(%)", "千張大戶持股比(%)", "小額持有人占比週變化(pp)"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
+    for c in ["受益人數", "受益人數週增減"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").round(0).astype("Int64")
     out.to_csv(os.path.join(output_dir, ETF_LATEST_FILE), index=False, encoding="utf-8-sig")
-    print(f"[ETF] 已輸出 {ETF_LATEST_FILE}（{len(out)} 檔｜行情 {len(quotes)}｜歷史 {len(metrics)}｜規模 {len(scale)}｜除息預告 {len(cal)}）")
+
+    # 配息月曆資料：近 14 個月已除息（Yahoo）＋證交所已公告的預告
+    div_rows = []
+    since = trade_date - dt.timedelta(days=430)
+    for code, df in yahoo.items():
+        idx = list(df.index)
+        for ex, amt in df["Dividends"][df["Dividends"] > 0].items():
+            if ex < since:
+                continue
+            prev = [d for d in idx if d < ex]
+            div_rows.append({"代號": code, "除息日": ex.isoformat(), "金額(元)": round(float(amt), 4), "狀態": "已除息",
+                             "發放日": "", "最後買進日": prev[-1].isoformat() if prev else ""})
+    for code, evs in cal.items():
+        for e in evs:
+            div_rows.append({"代號": code, "除息日": e["ex"].isoformat(), "金額(元)": e["amt"], "狀態": "預告",
+                             "發放日": e["pay"].isoformat() if e["pay"] else "", "最後買進日": _prev_bday(e["ex"], closed).isoformat()})
+    pd.DataFrame(div_rows, columns=["代號", "除息日", "金額(元)", "狀態", "發放日", "最後買進日"]).sort_values(
+        ["除息日", "代號"]).to_csv(os.path.join(output_dir, ETF_DIV_FILE), index=False, encoding="utf-8-sig")
+    print(f"[ETF] 已輸出 {ETF_LATEST_FILE}、{ETF_DIV_FILE}（{len(out)} 檔｜行情 {len(quotes)}｜歷史 {len(metrics)}｜規模 {len(scale)}"
+          f"｜除息預告 {len(cal)}｜持有人 {len(holders)}｜配息紀錄 {len(div_rows)} 筆）")
     return out
 
 

@@ -120,7 +120,7 @@
     <p class="text-[11px] text-slate-500 leading-relaxed">單位：張。三大法人＝外資＋投信＋自營商買賣超。<b>主力＝外資＋投信買賣超（近似值）</b>：真正的主力需要券商分點資料，官方沒有免費來源。融資／融券增減＝所選期間內餘額的變化。期間內資料尚未累積完整者顯示「—」。紅＝買超／增加，綠＝賣超／減少。僅供參考，非投資建議。</p>
   </section>
 
-  <!-- ETF：分類、配息月份、除息預告、殖利率、報酬、規模 -->
+  <!-- ETF：列表／配息月曆／持有人結構／同類比較 -->
   <section id="etfView" class="space-y-3 hidden">
     <div id="ecat" class="flex gap-2 overflow-x-auto pb-1"></div>
     <div class="flex flex-wrap items-center gap-3 text-xs text-slate-400">
@@ -128,14 +128,41 @@
       <div id="egrp" class="flex gap-2 overflow-x-auto"></div>
       <span id="etfDate" class="num"></span>
     </div>
+    <div id="esub" class="inline-flex rounded-lg bg-slate-800 p-1 text-sm"></div>
     <p id="etfHint" class="hidden text-xs text-amber-300/90"></p>
-    <div class="bg-slate-800/60 rounded-xl overflow-x-auto">
-      <table class="w-full min-w-[1280px] text-sm">
-        <thead class="text-slate-400 text-xs"><tr id="ehead"></tr></thead>
-        <tbody id="ebody" class="divide-y divide-slate-700/50"></tbody>
-      </table>
+
+    <div id="etf_list" class="space-y-2">
+      <div class="bg-slate-800/60 rounded-xl overflow-x-auto">
+        <table class="w-full min-w-[1700px] text-sm">
+          <thead class="text-slate-400 text-xs"><tr id="ehead"></tr></thead>
+          <tbody id="ebody" class="divide-y divide-slate-700/50"></tbody>
+        </table>
+      </div>
+      <p class="text-[11px] text-slate-500 leading-relaxed">近四季殖利率＝近 12 個月配息合計 ÷ 收盤價。年報酬（含息）＝近一年報酬，股息再投入（Yahoo 還原股價）。規模＝發行單位數 × 前一營業日淨值（證交所揭露）；折溢價為證交所揭露的預估值。「預告」＝證交所已公告的下一次除息，最後買進日＝除息交易日的前一個營業日，單次殖利率＝配息 ÷ 收盤價；尚未公告金額者留空。「已除息」＝最近一次已除息的資料，單次殖利率＝配息 ÷ 最後買進日收盤價。受益人數來自集保（每週更新）。上市不到一年者近四季與年報酬顯示「—」。說明為概要，僅供參考，非投資建議。</p>
     </div>
-    <p class="text-[11px] text-slate-500 leading-relaxed">近四季殖利率＝近 12 個月配息合計 ÷ 收盤價。年報酬（含息）＝近一年報酬，股息再投入（Yahoo 還原股價）。規模＝發行單位數 × 前一營業日淨值（證交所揭露）；折溢價為證交所揭露的預估值。「預告」＝證交所已公告的下一次除息，最後買進日＝除息交易日的前一個營業日，單次殖利率＝配息 ÷ 收盤價；尚未公告金額者留空。「已除息」＝最近一次已除息的資料，單次殖利率＝配息 ÷ 最後買進日收盤價。上市不到一年者近四季與年報酬顯示「—」。僅供參考，非投資建議。</p>
+
+    <div id="etf_cal" class="hidden space-y-2">
+      <div id="calGrid" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3"></div>
+      <p class="text-[11px] text-slate-500 leading-relaxed">依除息日所在月份排列（目前篩選的 ETF）。金額＝每單位配息（元），「每 1 張」＝每檔各持有 1 張（1,000 單位）的配息合計。已過去的月份是近 12 個月的實際除息，今年同月的實際日期與金額可能不同；橘色「預告」為證交所已公告的下一次除息。</p>
+    </div>
+
+    <div id="etf_holders" class="hidden space-y-2">
+      <div class="flex flex-wrap gap-3 text-[11px] text-slate-400" id="holderLegend"></div>
+      <div class="bg-slate-800/60 rounded-xl overflow-x-auto">
+        <table class="w-full min-w-[980px] text-sm">
+          <thead class="text-slate-400 text-xs"><tr id="hhead"></tr></thead>
+          <tbody id="hbody" class="divide-y divide-slate-700/50"></tbody>
+        </table>
+      </div>
+      <p class="text-[11px] text-slate-500 leading-relaxed">資料為集保戶股權分散表（每週最後一個營業日更新）。比例＝各級距人數 ÷ 該檔受益人數（1 張＝1,000 單位）。小額持有人＝持有不足 5 張者；「週變化」是和上一週相比的百分點變化（需累積兩週資料才會出現）。千張大戶持股比＝持有 1,000 張以上者占集保庫存的比例。</p>
+    </div>
+
+    <div id="etf_cmp" class="hidden space-y-2">
+      <div class="bg-slate-800/60 rounded-xl overflow-x-auto">
+        <table class="w-full text-sm" id="cmpTable"></table>
+      </div>
+      <p class="text-[11px] text-slate-500 leading-relaxed">在上方選一個分類，會把同類 ETF 並排比較；綠色「★」標出該列較佳者（規模、殖利率、報酬、受益人數取最大；折溢價取最接近 0）。僅供參考，非投資建議。</p>
+    </div>
   </section>
 
   <footer class="text-[11px] text-slate-500 pb-6">成交金額為收盤價 × 成交股數之近似值，單位：億元。僅供參考，非投資建議。</footer>
@@ -146,7 +173,7 @@
  * 預設載入的資料網址（相對於 index.html）。載入失敗時自動使用下方示範資料。
  * 若 Python 腳本另存一份固定檔名（如 stocks_latest.csv），就能每天自動更新。 */
 const CONFIG = {
-  DEFAULT_URLS: ["output/stocks_latest.csv", "output/sectors_latest.csv", "output/chips_latest.csv", "output/etf_latest.csv"],
+  DEFAULT_URLS: ["output/stocks_latest.csv", "output/sectors_latest.csv", "output/chips_latest.csv", "output/etf_latest.csv", "output/etf_dividends.csv"],
   CHART_SITE: "tradingview",   // 預設的 K 線圖網站；也可在「個股明細」頁用下拉選單切換（會記住選擇）
   // TradingView 圖表版面：填入你已儲存的版面代碼（網址 /chart/ 後面那串），開圖時會沿用你的指標與設定。
   // 例如 https://tw.tradingview.com/chart/fBMrpAnX/?symbol=TWSE%3A1303 → "fBMrpAnX"。
@@ -193,7 +220,7 @@ let savedPeriod = 5;
 try { const v = +localStorage.getItem("chipPeriod"); if ([1, 5, 10, 20, 60].includes(v)) savedPeriod = v; } catch (e) {}
 let savedSite = null;
 try { savedSite = localStorage.getItem("chartSite2"); } catch (e) {}
-const S = { etf:null, ecat:null, egrp:null, esort:{key:"ttmYield", dir:-1}, chips:null, csort:{key:"main", dir:-1}, period:savedPeriod, data:null, sample:false, view:"overview", filter:null, weighted:false, highlight:null, scrollToHit:false, listFor:null, sort:{key:"pct1d",dir:-1},
+const S = { etf:null, etfDiv:null, esub:"list", ecat:null, egrp:null, esort:{key:"ttmYield", dir:-1}, chips:null, csort:{key:"main", dir:-1}, period:savedPeriod, data:null, sample:false, view:"overview", filter:null, weighted:false, highlight:null, scrollToHit:false, listFor:null, sort:{key:"pct1d",dir:-1},
   chartSite: CHART_SITES[savedSite] ? savedSite : CONFIG.CHART_SITE };
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -241,6 +268,9 @@ function normEtf(r) {
     amt: numN(r["成交金額(億)"]), aum: numN(r["規模(億)"]), prem: numN(r["折溢價(%)"]), ttmDiv: numN(r["近四季配息(元)"]),
     ttmYield: numN(r["近四季殖利率(%)"]), ret1y: numN(r["年報酬含息(%)"]), exState: r["除息狀態"] || "", exDate: r["除息日"] || "",
     lastBuy: r["最後買進日"] || "", payDate: r["發放日"] || "", divAmt: numN(r["配息金額(元)"]), divYield: numN(r["單次殖利率(%)"]),
+    desc: r["說明"] || "", holders: numN(r["受益人數"]), hDelta: numN(r["受益人數週增減"]),
+    b1: numN(r["持有人_不足1張(%)"]), b2: numN(r["持有人_1~5張(%)"]), b3: numN(r["持有人_5~10張(%)"]), b4: numN(r["持有人_10~50張(%)"]),
+    b5: numN(r["持有人_50張以上(%)"]), whale: numN(r["千張大戶持股比(%)"]), hDate: r["持有人資料日期"] || "", smallDelta: numN(r["小額持有人占比週變化(pp)"]),
     market: String(r["市場"] || "").trim().toUpperCase() };
 }
 const PERIODS = [1, 5, 10, 20, 60];
@@ -275,19 +305,21 @@ function computeSectors(stocks) {
 
 /* ===== 載入資料 ===== */
 function ingest(texts) {
-  let stocks = null, sectors = null, date = null, chips = null, etf = null;
+  let stocks = null, sectors = null, date = null, chips = null, etf = null, etfDiv = null;
   for (const t0 of texts) {
     const t = t0.trim();
     if (t.startsWith("{")) { const j = JSON.parse(t); stocks = j.stocks; sectors = j.sectors; date = j.date; continue; }
     const rows = parseCSV(t); if (!rows.length) continue;
     if ("近四季殖利率(%)" in rows[0]) { etf = rows.map(normEtf); continue; }
+    if ("除息日" in rows[0] && "金額(元)" in rows[0]) { etfDiv = rows.map(r => ({ code: r["代號"], ex: r["除息日"], amt: numN(r["金額(元)"]), state: r["狀態"] || "", pay: r["發放日"] || "", lastBuy: r["最後買進日"] || "" })); continue; }
     if ("外資_1日" in rows[0]) { chips = new Map(rows.map(normChip).map(c => [c.code, c])); continue; }
     if ("代號" in rows[0]) stocks = rows.map(normStock);
     else if ("族群" in rows[0]) sectors = rows.map(normSector);
   }
   if (chips) S.chips = chips;
   if (etf) S.etf = etf;
-  if ((!stocks || !stocks.length) && (chips || etf) && S.data) return;     // 只匯入籌碼檔：沿用目前的個股資料
+  if (etfDiv) S.etfDiv = etfDiv;
+  if ((!stocks || !stocks.length) && (chips || etf || etfDiv) && S.data) return;     // 只匯入籌碼檔：沿用目前的個股資料
   if (!stocks || !stocks.length) throw new Error("找不到個股資料（CSV 需含「代號」欄位）");
   S.data = { date: date || stocks[0].date || "-", stocks, sectors: sectors && sectors.length ? sectors : computeSectors(stocks) };
   S.sample = false; S.filter = null;
@@ -426,32 +458,19 @@ function renderChips() {
 
 const ECOLS = [["name","代號／名稱"],["cat","分類"],["grp","配息月份"],["close","收盤價"],["pct","當日"],["aum","規模(億)"],
   ["prem","折溢價"],["ttmYield","近四季殖利率"],["ret1y","年報酬(含息)"],["ttmDiv","近四季配息"],["exDate","除息日"],
-  ["lastBuy","最後買進日"],["divAmt","配息(元)"],["divYield","單次殖利率"],["amt","成交金額(億)"]];
-const EGRPS = ["1/4/7/10", "2/5/8/11", "3/6/9/12"];
+  ["lastBuy","最後買進日"],["divAmt","配息(元)"],["divYield","單次殖利率"],["holders","受益人數"],["amt","成交金額(億)"],["desc","說明"]];
+const EGRPS = ["1/4/7/10", "2/5/8/11", "3/6/9/12", "月配"];
 const mdStr = s => s ? s.slice(5).replace("-", "/") : "";
 const ePct = (v, signed) => v == null ? `<span class="text-slate-600">—</span>` : `<span class="${signed ? col(v) : ""}">${signed && v > 0 ? "+" : ""}${v.toFixed(2)}%</span>`;
 const eNum = (v, d) => v == null ? `<span class="text-slate-600">—</span>` : v.toLocaleString("zh-TW", { minimumFractionDigits: d, maximumFractionDigits: d });
-function renderEtf() {
-  const list = S.etf || [];
-  const cats = [...new Set(list.map(e => e.cat).filter(Boolean))];
-  $("ecat").innerHTML = [null, ...cats].map(n => `<button data-ecat="${n === null ? "" : esc(n)}" class="chip shrink-0 px-3 py-1 rounded-full text-sm ${S.ecat === n ? "bg-sky-600" : "bg-slate-800 hover:bg-slate-700"}">${n === null ? "全部" : esc(n)}</button>`).join("");
-  const grps = [null, ...EGRPS.filter(g => list.some(e => e.grp === g)), ...(list.some(e => !e.grp) ? ["_none"] : [])];
-  $("egrp").innerHTML = grps.map(g => `<button data-egrp="${g === null ? "" : esc(g)}" class="chip shrink-0 px-2.5 py-1 rounded-full text-xs ${S.egrp === g ? "bg-sky-600" : "bg-slate-800 hover:bg-slate-700"}">${g === null ? "全部" : g === "_none" ? "未分組" : esc(g)}</button>`).join("");
-  $("ehead").innerHTML = ECOLS.map(([k, t], i) => `<th data-esort="${k}" class="sortable ${i === 0 ? "sticky-col text-left" : (k === "cat" || k === "grp") ? "text-left" : "text-right"} px-3 py-2 font-medium whitespace-nowrap">${t}${S.esort.key === k ? (S.esort.dir > 0 ? " ▲" : " ▼") : ""}</th>`).join("");
-  const hint = $("etfHint");
-  if (!list.length) {
-    $("etfDate").textContent = "";
-    hint.textContent = "尚無 ETF 資料（output/etf_latest.csv 還沒產生）。腳本更新後，下一次自動更新就會出現。";
-    hint.classList.remove("hidden");
-    $("ebody").innerHTML = `<tr><td colspan="${ECOLS.length}" class="px-3 py-6 text-center text-slate-500">沒有資料</td></tr>`;
-    return;
-  }
-  hint.classList.add("hidden");
-  $("etfDate").textContent = "行情資料 " + (list.find(e => e.date) || {}).date;
-  const rows = list.filter(e => (S.ecat === null || e.cat === S.ecat) && (S.egrp === null || (S.egrp === "_none" ? !e.grp : e.grp === S.egrp)));
+const etfFiltered = () => (S.etf || []).filter(e => (S.ecat === null || e.cat === S.ecat) && (S.egrp === null || (S.egrp === "_none" ? !e.grp : e.grp === S.egrp)));
+const HBUCKETS = [["b1", "不足 1 張", "bg-slate-500"], ["b2", "1～5 張", "bg-sky-600"], ["b3", "5～10 張", "bg-teal-500"], ["b4", "10～50 張", "bg-amber-500"], ["b5", "50 張以上", "bg-rose-500"]];
+
+function renderEtfList(rows) {
+  $("ehead").innerHTML = ECOLS.map(([k, t], i) => `<th data-esort="${k}" class="sortable ${i === 0 ? "sticky-col text-left" : (k === "cat" || k === "grp" || k === "desc") ? "text-left" : "text-right"} px-3 py-2 font-medium whitespace-nowrap">${t}${S.esort.key === k ? (S.esort.dir > 0 ? " ▲" : " ▼") : ""}</th>`).join("");
   const { key, dir } = S.esort;
-  const val = e => key === "name" ? e.code : (["cat", "grp", "exDate", "lastBuy"].includes(key) ? (e[key] || null) : e[key]);
-  rows.sort((a, b) => { const x = val(a), y = val(b);
+  const val = e => key === "name" ? e.code : (["cat", "grp", "exDate", "lastBuy", "desc"].includes(key) ? (e[key] || null) : e[key]);
+  rows = rows.slice().sort((a, b) => { const x = val(a), y = val(b);
     if (x == null && y == null) return 0; if (x == null) return 1; if (y == null) return -1;
     return (x > y ? 1 : x < y ? -1 : 0) * dir; });
   $("ebody").innerHTML = rows.map(e => {
@@ -472,8 +491,121 @@ function renderEtf() {
       <td class="num text-right px-3 py-2 ${upcoming ? "text-amber-300 font-medium" : ""}">${e.lastBuy ? mdStr(e.lastBuy) : `<span class="text-slate-600">—</span>`}</td>
       <td class="num text-right px-3 py-2">${eNum(e.divAmt, 2)}</td>
       <td class="num text-right px-3 py-2">${ePct(e.divYield, false)}</td>
-      <td class="num text-right px-3 py-2">${eNum(e.amt, 2)}</td></tr>`;
+      <td class="num text-right px-3 py-2">${eNum(e.holders, 0)}</td>
+      <td class="num text-right px-3 py-2">${eNum(e.amt, 2)}</td>
+      <td class="px-3 py-2 text-xs text-slate-400"><div class="w-[26rem] truncate" title="${esc(e.desc)}">${esc(e.desc) || "—"}</div></td></tr>`;
   }).join("") || `<tr><td colspan="${ECOLS.length}" class="px-3 py-6 text-center text-slate-500">沒有資料</td></tr>`;
+}
+
+function renderEtfCal(rows) {
+  const grid = $("calGrid");
+  if (!S.etfDiv || !S.etfDiv.length) {
+    grid.innerHTML = `<div class="col-span-full px-3 py-6 text-center text-slate-500 bg-slate-800/60 rounded-xl">尚無配息資料（output/etf_dividends.csv 還沒產生）。腳本更新後，下一次自動更新就會出現。</div>`;
+    return;
+  }
+  const names = new Map(rows.map(e => [e.code, e.name])), shown = new Set(rows.map(e => e.code));
+  const latest = (S.etf.find(e => e.date) || {}).date || new Date().toISOString().slice(0, 10);
+  const since = new Date(new Date(latest).getTime() - 365 * 86400000).toISOString().slice(0, 10);
+  const jan1 = latest.slice(0, 4) + "-01-01";
+  const byMonth = Array.from({ length: 12 }, () => []);
+  S.etfDiv.filter(d => shown.has(d.code) && d.ex >= since).forEach(d => byMonth[+d.ex.slice(5, 7) - 1].push(d));
+  grid.innerHTML = byMonth.map((evs, i) => {
+    evs.sort((a, b) => a.ex.localeCompare(b.ex) || a.code.localeCompare(b.code));
+    const total = evs.reduce((s, d) => s + (d.amt || 0), 0) * 1000;
+    const body = evs.map(d => `<div class="flex items-baseline justify-between gap-2 py-0.5">
+        <span class="truncate"><span class="num text-slate-400">${mdStr(d.ex)}</span>${d.ex < jan1 ? `<span class="text-[10px] text-slate-600">（去年）</span>` : ""} ${esc(names.get(d.code) || d.code)}</span>
+        <span class="num whitespace-nowrap ${d.state === "預告" ? "text-amber-300" : "text-slate-300"}">${d.amt != null ? d.amt.toFixed(2) : "金額未公告"}${d.state === "預告" ? " 預告" : ""}</span></div>`).join("");
+    return `<div class="bg-slate-800/60 rounded-xl p-3 ${evs.length ? "" : "opacity-60"}">
+      <div class="flex items-baseline justify-between mb-1"><span class="font-semibold">${i + 1} 月</span>
+      <span class="num text-xs text-slate-400">${evs.length ? "每 1 張 " + Math.round(total).toLocaleString("zh-TW") + " 元" : ""}</span></div>
+      <div class="text-xs">${body || `<span class="text-slate-600">—</span>`}</div></div>`;
+  }).join("");
+}
+
+function renderEtfHolders(rows) {
+  $("holderLegend").innerHTML = HBUCKETS.map(([k, t, c]) => `<span class="inline-flex items-center gap-1"><i class="inline-block w-3 h-3 rounded-sm ${c}"></i>${t}</span>`).join("");
+  $("hhead").innerHTML = ["代號／名稱", "受益人數", "週增減", "持有人結構（人數占比）", "小額持有人占比（<5 張）", "週變化(pp)", "千張大戶持股比", "資料日期"]
+    .map((t, i) => `<th class="${i === 0 ? "sticky-col text-left" : i === 3 ? "text-left" : "text-right"} px-3 py-2 font-medium whitespace-nowrap">${t}</th>`).join("");
+  const sorted = rows.slice().sort((a, b) => (a.holders == null) - (b.holders == null) || (b.holders || 0) - (a.holders || 0));   // 有資料的在前、人數多的在前
+  $("hbody").innerHTML = sorted.map(e => {
+    const has = e.b1 != null;
+    const bar = has ? `<div class="flex h-4 rounded overflow-hidden w-64">${HBUCKETS.map(([k, t, c]) => `<div class="${c}" style="width:${e[k]}%" title="${t}：${e[k].toFixed(2)}%"></div>`).join("")}</div>
+      <div class="num text-[10px] text-slate-400 mt-0.5">${HBUCKETS.map(([k]) => e[k].toFixed(1)).join(" / ")}</div>` : `<span class="text-slate-600">—</span>`;
+    const small = has ? e.b1 + e.b2 : null;
+    return `<tr class="hover:bg-slate-700/30">
+      <td class="sticky-col px-3 py-2 whitespace-nowrap"><span class="num text-slate-400">${esc(e.code)}</span> <a href="${chartUrl(e.code, e.market)}" target="_blank" rel="noopener noreferrer" class="font-medium text-sky-300 hover:underline">${esc(e.name)}</a></td>
+      <td class="num text-right px-3 py-2">${eNum(e.holders, 0)}</td>
+      <td class="num text-right px-3 py-2">${e.hDelta == null ? `<span class="text-slate-600">—</span>` : `<span class="${col(e.hDelta)}">${e.hDelta > 0 ? "+" : ""}${e.hDelta.toLocaleString("zh-TW")}</span>`}</td>
+      <td class="px-3 py-2">${bar}</td>
+      <td class="num text-right px-3 py-2">${ePct(small, false)}</td>
+      <td class="num text-right px-3 py-2">${e.smallDelta == null ? `<span class="text-slate-600">—</span>` : `<span class="${col(e.smallDelta)}">${e.smallDelta > 0 ? "+" : ""}${e.smallDelta.toFixed(2)}</span>`}</td>
+      <td class="num text-right px-3 py-2">${ePct(e.whale, false)}</td>
+      <td class="num text-right px-3 py-2 text-slate-400">${e.hDate || "—"}</td></tr>`;
+  }).join("") || `<tr><td colspan="8" class="px-3 py-6 text-center text-slate-500">沒有資料</td></tr>`;
+}
+
+function renderEtfCompare(rows) {
+  const t = $("cmpTable");
+  if (S.ecat === null) { t.innerHTML = `<tbody><tr><td class="px-3 py-6 text-center text-slate-500">請先在上方選一個分類（例如「高股息／收益型」），再並排比較同類 ETF。</td></tr></tbody>`; return; }
+  if (!rows.length) { t.innerHTML = `<tbody><tr><td class="px-3 py-6 text-center text-slate-500">沒有資料</td></tr></tbody>`; return; }
+  const list = rows.slice().sort((a, b) => (a.aum == null) - (b.aum == null) || (b.aum || 0) - (a.aum || 0));      // 有資料的在前、規模大的在前
+  const best = (get, mode) => { const vs = list.map(get).filter(v => v != null); if (!vs.length) return null;
+    return mode === "near0" ? vs.reduce((m, v) => Math.abs(v) < Math.abs(m) ? v : m) : Math.max(...vs); };
+  const ROWS = [
+    ["說明", e => `<div class="text-xs text-slate-400 whitespace-normal min-w-[12rem] max-w-[16rem]">${esc(e.desc) || "—"}</div>`],
+    ["發行投信", e => esc(e.issuer) || "—"],
+    ["配息月份", e => esc(e.grp) || "—"],
+    ["收盤價", e => eNum(e.close, 2)],
+    ["當日", e => ePct(e.pct, true)],
+    ["規模(億)", e => eNum(e.aum, 0), e => e.aum, "max"],
+    ["近四季殖利率", e => ePct(e.ttmYield, false), e => e.ttmYield, "max"],
+    ["年報酬(含息)", e => ePct(e.ret1y, true), e => e.ret1y, "max"],
+    ["近四季配息(元)", e => eNum(e.ttmDiv, 2)],
+    ["折溢價", e => ePct(e.prem, true), e => e.prem, "near0"],
+    ["下次／最近除息", e => e.exDate ? (e.exState === "預告" ? `<span class="text-amber-300">預告 ${mdStr(e.exDate)}</span>` : `已除息 ${mdStr(e.exDate)}`) : "—"],
+    ["最後買進日", e => e.lastBuy ? mdStr(e.lastBuy) : "—"],
+    ["單次殖利率", e => ePct(e.divYield, false)],
+    ["受益人數", e => eNum(e.holders, 0), e => e.holders, "max"],
+    ["小額持有人占比（<5 張）", e => ePct(e.b1 != null ? e.b1 + e.b2 : null, false)],
+    ["千張大戶持股比", e => ePct(e.whale, false)],
+    ["成交金額(億)", e => eNum(e.amt, 2)],
+  ];
+  const head = `<thead class="text-slate-400 text-xs"><tr><th class="sticky-col text-left px-3 py-2 font-medium"></th>${list.map(e =>
+    `<th class="text-left px-3 py-2 font-medium whitespace-nowrap"><span class="num text-slate-400">${esc(e.code)}</span><br><a href="${chartUrl(e.code, e.market)}" target="_blank" rel="noopener noreferrer" class="text-sky-300 hover:underline">${esc(e.name)}</a></th>`).join("")}</tr></thead>`;
+  const body = ROWS.map(([label, fmt, get, mode]) => {
+    const b = get ? best(get, mode) : null;
+    return `<tr class="border-t border-slate-700/50"><td class="sticky-col px-3 py-2 text-slate-400 whitespace-nowrap align-top">${label}</td>${list.map(e => {
+      const v = get ? get(e) : null, star = get && v != null && b != null && v === b && list.length > 1;
+      return `<td class="num px-3 py-2 align-top ${star ? "text-emerald-300 font-medium" : ""}">${fmt(e)}${star ? " ★" : ""}</td>`; }).join("")}</tr>`;
+  }).join("");
+  t.innerHTML = head + `<tbody>${body}</tbody>`;
+}
+
+function renderEtf() {
+  const list = S.etf || [];
+  const cats = [...new Set(list.map(e => e.cat).filter(Boolean))];
+  $("ecat").innerHTML = [null, ...cats].map(n => `<button data-ecat="${n === null ? "" : esc(n)}" class="chip shrink-0 px-3 py-1 rounded-full text-sm ${S.ecat === n ? "bg-sky-600" : "bg-slate-800 hover:bg-slate-700"}">${n === null ? "全部" : esc(n)}</button>`).join("");
+  const grps = [null, ...EGRPS.filter(g => list.some(e => e.grp === g)), ...(list.some(e => !e.grp) ? ["_none"] : [])];
+  $("egrp").innerHTML = grps.map(g => `<button data-egrp="${g === null ? "" : esc(g)}" class="chip shrink-0 px-2.5 py-1 rounded-full text-xs ${S.egrp === g ? "bg-sky-600" : "bg-slate-800 hover:bg-slate-700"}">${g === null ? "全部" : g === "_none" ? "未分組" : esc(g)}</button>`).join("");
+  $("esub").innerHTML = [["list", "列表"], ["cal", "配息月曆"], ["holders", "持有人結構"], ["cmp", "同類比較"]]
+    .map(([k, t]) => `<button data-esub="${k}" class="px-3 py-1 rounded-md ${S.esub === k ? "bg-sky-600" : "text-slate-300"}">${t}</button>`).join("");
+  ["list", "cal", "holders", "cmp"].forEach(k => $("etf_" + k).classList.toggle("hidden", S.esub !== k));
+  const hint = $("etfHint");
+  if (!list.length) {
+    $("etfDate").textContent = "";
+    hint.textContent = "尚無 ETF 資料（output/etf_latest.csv 還沒產生）。腳本更新後，下一次自動更新就會出現。";
+    hint.classList.remove("hidden");
+    $("ebody").innerHTML = `<tr><td colspan="${ECOLS.length}" class="px-3 py-6 text-center text-slate-500">沒有資料</td></tr>`;
+    $("calGrid").innerHTML = ""; $("hbody").innerHTML = ""; $("cmpTable").innerHTML = "";
+    return;
+  }
+  hint.classList.add("hidden");
+  $("etfDate").textContent = "行情資料 " + (list.find(e => e.date) || {}).date;
+  const rows = etfFiltered();
+  if (S.esub === "cal") renderEtfCal(rows);
+  else if (S.esub === "holders") renderEtfHolders(rows);
+  else if (S.esub === "cmp") renderEtfCompare(rows);
+  else renderEtfList(rows);
 }
 
 function render() {
@@ -500,7 +632,7 @@ function pick(name) { S.filter = name || null; S.highlight = null; $("q").value 
 
 /* ===== 事件 ===== */
 document.addEventListener("click", e => {
-  const t = e.target.closest("[data-view],[data-w],[data-sector],[data-chip],[data-sort],[data-clear],[data-p],[data-csort],[data-ecat],[data-egrp],[data-esort]"); if (!t) return;
+  const t = e.target.closest("[data-view],[data-w],[data-sector],[data-chip],[data-sort],[data-clear],[data-p],[data-csort],[data-ecat],[data-egrp],[data-esort],[data-esub]"); if (!t) return;
   if (t.dataset.view) { S.view = t.dataset.view; render(); }
   else if (t.dataset.w) { S.weighted = t.dataset.w === "1"; render(); }
   else if (t.dataset.sector) pick(t.dataset.sector);
@@ -509,6 +641,7 @@ document.addEventListener("click", e => {
   else if (t.dataset.p) { S.period = +t.dataset.p; try { localStorage.setItem("chipPeriod", S.period); } catch (err) {} renderChips(); }
   else if (t.dataset.ecat !== undefined) { S.ecat = t.dataset.ecat === "" ? null : t.dataset.ecat; renderEtf(); }
   else if (t.dataset.egrp !== undefined) { S.egrp = t.dataset.egrp === "" ? null : t.dataset.egrp; renderEtf(); }
+  else if (t.dataset.esub) { S.esub = t.dataset.esub; renderEtf(); }
   else if (t.dataset.esort) { const k = t.dataset.esort; S.esort = { key:k, dir: S.esort.key === k ? -S.esort.dir : -1 }; renderEtf(); }
   else if (t.dataset.csort) { const k = t.dataset.csort; S.csort = { key:k, dir: S.csort.key === k ? -S.csort.dir : -1 }; renderChips(); }
   else if (t.dataset.sort) { const k = t.dataset.sort; S.sort = { key:k, dir: S.sort.key === k ? -S.sort.dir : -1 }; renderStocks(); }
