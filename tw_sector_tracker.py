@@ -2009,8 +2009,8 @@ ETF_DETAIL: List[Tuple[str, str, str, str, str, str, str]] = [
     ("0052", "富邦科技", "科技／半導體主題", "", "", "富邦", "投資台灣資訊科技類股（半導體、電子為主）的科技型 ETF，富邦投信發行"),
     ("00904", "新光臺灣半導體30", "科技／半導體主題", "", "1/4/7/10", "新光", "新光投信的台灣半導體 ETF，成分股 30 檔"),
     ("00891", "中信關鍵半導體", "科技／半導體主題", "", "2/5/8/11", "中信", "中信投信的關鍵半導體 ETF：投資台灣半導體產業鏈（設計、製造、封測、設備）的關鍵公司"),
-    ("00981A", "主動統一台股增長", "主動式", "", "3/6/9/12", "統一", "統一投信的主動式 ETF，經理人主動選股、偏重成長；主動式 ETF 每日公開持股"),
-    ("00403A", "主動統一升級50", "主動式", "", "", "統一", "統一投信的主動式 ETF，由經理人主動挑選台股"),
+    ("00981A", "主動統一台股增長", "主動式", "", "3/6/9/12", "統一", "統一投信主動式 ETF，經理人陳釧瑤；以台股市值前 300 大為選股池、至少 60% 配置大型股，挑選創新、高成長企業；不追蹤指數，績效評量指標為發行量加權股價報酬指數；季配（有收益平準金）；每日公開持股"),
+    ("00403A", "主動統一升級50", "主動式", "", "2/5/8/11", "統一", "統一投信主動式 ETF，經理人張哲瑋；至少 60% 配置市值前 200 大、以前 50 大為核心並「汰弱增強」，原則 50 檔、單一持股上限 30%；季配（2/5/8/11 月除息，有收益平準金）；經理費 1.2%（200 億以下）、保管費 0.035%；每日公開持股"),
 ]
 ETF_CODES = [e[0] for e in ETF_DETAIL]
 ETF_LATEST_FILE = "etf_latest.csv"
@@ -2020,8 +2020,11 @@ ETF_COLS = ["代號", "名稱", "分類", "標籤", "配息月份", "發行投�
             "規模(億)", "折溢價(%)", "近四季配息(元)", "近四季殖利率(%)", "年報酬含息(%)",
             "除息狀態", "除息日", "最後買進日", "發放日", "配息金額(元)", "單次殖利率(%)",
             "受益人數", "持有人_不足1張(%)", "持有人_1~5張(%)", "持有人_5~10張(%)", "持有人_10~50張(%)", "持有人_50張以上(%)",
-            "千張大戶持股比(%)", "持有人資料日期", "受益人數週增減", "小額持有人占比週變化(pp)", "市場"]
+            "千張大戶持股比(%)", "持有人資料日期", "受益人數週增減", "小額持有人占比週變化(pp)",
+            "近8次填息率(%)", "平均填息天數", "最近填息狀態", "市場"]
 ETF_DIV_FILE = "etf_dividends.csv"
+ETF_FILL_FILE = "etf_fill.csv"
+FILL_MATURE_DAYS = 20          # 除息後至少經過幾個交易日，沒填息才算「未填息」（較新的算進行中）
 ETF_HOLDERS_FILE = "etf_holders.csv"
 TDCC_URL = "https://smart.tdcc.com.tw/opendata/getOD.ashx?id=1-5"
 
@@ -2092,6 +2095,47 @@ def etf_metrics(df: pd.DataFrame) -> Dict[str, object]:
         if prev:
             out["last_buy"] = prev[-1]
             out["last_yield"] = amt / float(df.loc[prev[-1], "Close"])
+    return out
+
+
+def fill_events(df: pd.DataFrame) -> List[dict]:
+    """
+    每次除息的填息狀況（用未還原收盤價）：
+      除息前收盤 p0＝除息日前一個交易日（最後買進日）的收盤價
+      填息＝除息日起（含當天，當天算第 1 天）第一個收盤價 ≥ p0 的交易日
+      目前填息率＝(最新收盤 − 除息參考價) ÷ 配息，其中除息參考價＝p0 − 配息
+    """
+    if df is None or df.empty:
+        return []
+    dates, closes = list(df.index), df["Close"].astype(float).tolist()
+    pos = {d: i for i, d in enumerate(dates)}
+    last = closes[-1]
+    events = []
+    for ex, amt in df["Dividends"][df["Dividends"] > 0].items():
+        i = pos.get(ex)
+        if not i:                                    # 找不到或是第一筆，沒有除息前收盤可比
+            continue
+        amt, p0 = float(amt), closes[i - 1]
+        days = next((k - i + 1 for k in range(i, len(dates)) if closes[k] >= p0), None)
+        events.append({"ex": ex, "amt": amt, "p0": p0, "days": days, "elapsed": len(dates) - i,
+                       "rate": (last - (p0 - amt)) / amt * 100 if amt > 0 else None})
+    return events
+
+
+def fill_summary(events: List[dict], n: int = 8) -> Dict[str, object]:
+    """近 n 次的填息率（只算已填息或除息滿 FILL_MATURE_DAYS 個交易日者）、平均填息天數、最近一次狀態。"""
+    out: Dict[str, object] = {}
+    recent = events[-n:]
+    mature = [e for e in recent if e["days"] is not None or e["elapsed"] >= FILL_MATURE_DAYS]
+    if mature:
+        out["ratio"] = sum(1 for e in mature if e["days"] is not None) / len(mature) * 100
+    days = [e["days"] for e in recent if e["days"] is not None]
+    if days:
+        out["avg_days"] = sum(days) / len(days)
+    if events:
+        e = events[-1]
+        out["last"] = (f"已填息 {e['days']} 天" if e["days"] is not None
+                       else f"進行中 {e['rate']:.0f}%" if e["elapsed"] < FILL_MATURE_DAYS else f"未填息 {e['rate']:.0f}%")
     return out
 
 
@@ -2293,6 +2337,7 @@ def update_etf(output_dir: str, trade_date: dt.date) -> Optional[pd.DataFrame]:
     quotes = _etf_quotes(trade_date)
     yahoo = fetch_etf_yahoo(ETF_CODES)
     metrics = {c: etf_metrics(df) for c, df in yahoo.items()}
+    fills = {c: fill_events(df) for c, df in yahoo.items()}
     try:
         scale = fetch_etf_scale(quotes)
     except Exception as e:
@@ -2341,6 +2386,9 @@ def update_etf(output_dir: str, trade_date: dt.date) -> Optional[pd.DataFrame]:
                "持有人資料日期": holder_date.isoformat() if hd and holder_date else "",
                "受益人數週增減": (hd["holders"] - int(hp["受益人數"])) if hd and hp else None,
                "小額持有人占比週變化(pp)": ((hd["b1"] + hd["b2"]) - (float(hp["不足1張"]) + float(hp["1~5張"]))) if hd and hp else None,
+               "近8次填息率(%)": fill_summary(fills.get(code, [])).get("ratio"),
+               "平均填息天數": fill_summary(fills.get(code, [])).get("avg_days"),
+               "最近填息狀態": fill_summary(fills.get(code, [])).get("last", ""),
                "市場": (q.get("市場") if q else "TWSE")}
         nxt = (cal.get(code) or [None])[0]
         if nxt:                                           # 有預告：顯示下一次除息
@@ -2357,7 +2405,8 @@ def update_etf(output_dir: str, trade_date: dt.date) -> Optional[pd.DataFrame]:
     out = pd.DataFrame(rows)[ETF_COLS]
     for c in ["收盤價", "當日漲跌幅(%)", "成交金額(億)", "規模(億)", "折溢價(%)", "近四季配息(元)",
               "近四季殖利率(%)", "年報酬含息(%)", "配息金額(元)", "單次殖利率(%)", "持有人_不足1張(%)", "持有人_1~5張(%)",
-              "持有人_5~10張(%)", "持有人_10~50張(%)", "持有人_50張以上(%)", "千張大戶持股比(%)", "小額持有人占比週變化(pp)"]:
+              "持有人_5~10張(%)", "持有人_10~50張(%)", "持有人_50張以上(%)", "千張大戶持股比(%)", "小額持有人占比週變化(pp)",
+              "近8次填息率(%)", "平均填息天數"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
     for c in ["受益人數", "受益人數週增減"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(0).astype("Int64")
@@ -2380,7 +2429,16 @@ def update_etf(output_dir: str, trade_date: dt.date) -> Optional[pd.DataFrame]:
                              "發放日": e["pay"].isoformat() if e["pay"] else "", "最後買進日": _prev_bday(e["ex"], closed).isoformat()})
     pd.DataFrame(div_rows, columns=["代號", "除息日", "金額(元)", "狀態", "發放日", "最後買進日"]).sort_values(
         ["除息日", "代號"]).to_csv(os.path.join(output_dir, ETF_DIV_FILE), index=False, encoding="utf-8-sig")
-    print(f"[ETF] 已輸出 {ETF_LATEST_FILE}、{ETF_DIV_FILE}（{len(out)} 檔｜行情 {len(quotes)}｜歷史 {len(metrics)}｜規模 {len(scale)}"
+    fill_rows = []
+    for code, evs in fills.items():
+        for e in evs[-12:]:
+            fill_rows.append({"代號": code, "除息日": e["ex"].isoformat(), "配息(元)": round(e["amt"], 4), "除息前收盤": round(e["p0"], 2),
+                              "狀態": "已填息" if e["days"] is not None else ("進行中" if e["elapsed"] < FILL_MATURE_DAYS else "未填息"),
+                              "填息天數": e["days"], "已過交易日": e["elapsed"],
+                              "目前填息率(%)": round(e["rate"], 1) if e["rate"] is not None else None})
+    pd.DataFrame(fill_rows, columns=["代號", "除息日", "配息(元)", "除息前收盤", "狀態", "填息天數", "已過交易日", "目前填息率(%)"]).sort_values(
+        ["代號", "除息日"]).to_csv(os.path.join(output_dir, ETF_FILL_FILE), index=False, encoding="utf-8-sig")
+    print(f"[ETF] 已輸出 {ETF_LATEST_FILE}、{ETF_DIV_FILE}、{ETF_FILL_FILE}（{len(out)} 檔｜行情 {len(quotes)}｜歷史 {len(metrics)}｜規模 {len(scale)}"
           f"｜除息預告 {len(cal)}｜持有人 {len(holders)}｜配息紀錄 {len(div_rows)} 筆）")
     return out
 
