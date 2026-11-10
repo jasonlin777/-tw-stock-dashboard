@@ -30,11 +30,14 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import json
 import os
 import re
 import sys
 import time
 from typing import Dict, List, Optional, Tuple
+
+from html import unescape
 
 import pandas as pd
 import requests
@@ -2443,6 +2446,264 @@ def update_etf(output_dir: str, trade_date: dt.date) -> Optional[pd.DataFrame]:
     return out
 
 
+# ----------------------------------------------------------------------
+# 10. 主動式 ETF 專區：每日持股與異動（新增／加碼／減碼／剔除）
+# ----------------------------------------------------------------------
+# 主動式 ETF 每個營業日都會公開投資組合明細。本區塊：
+#   1) 抓每日持股（統一投信官網；自動抓取失敗時，可把官網下載的 Excel／CSV 放進 holdings_manual/ 資料夾，見下）
+#   2) 累積進 output/etf_holdings.csv（保留約 130 天）
+#   3) 和前一個資料日比較，算出新增／加碼／減碼／剔除，輸出 etf_holdings_changes.csv 與 etf_holdings_latest.csv
+# 手動匯入：檔名為「ETF代號_YYYY-MM-DD.csv」或「.xlsx」，例如 holdings_manual/00981A_2026-11-09.xlsx；
+#           內容要有「股票代號、股票名稱、股數、權重」這幾欄（官網匯出的檔案通常就是）。
+# 自動抓取只對有設定來源的 ETF 嘗試；任何一步失敗都只會警告，不影響其他資料。
+
+HOLDINGS_FILE = "etf_holdings.csv"
+HOLDINGS_LATEST_FILE = "etf_holdings_latest.csv"
+HOLDINGS_CHANGES_FILE = "etf_holdings_changes.csv"
+HOLDINGS_MANUAL_DIR = "holdings_manual"
+HOLDINGS_KEEP_DAYS = 130
+HOLDINGS_MIN_SHARES = 1000          # 股數變動不足 1 張視為不變
+ACTIVE_CODES = [e[0] for e in ETF_DETAIL if e[2] == "主動式"]
+# 統一投信官網：每檔基金的 fundCode。00981A 的代碼是依記憶填的；沒填或失效時，會到官網頁面自動尋找。
+UPAMC_FUNDCODES: Dict[str, str] = {"00981A": "49YTW"}
+UPAMC_INFO_URL = "https://www.ezmoney.com.tw/ETF/Fund/Info?fundCode={fund}"
+UPAMC_EXCEL_URL = "https://www.ezmoney.com.tw/ETF/Fund/AssetExcel?fundCode={fund}"
+UPAMC_DISCOVER_URLS = ["https://www.ezmoney.com.tw/ETF/Fund/List", "https://www.ezmoney.com.tw/"]
+HOLDING_COLS = ["日期", "ETF", "股票代號", "股票名稱", "股數", "權重(%)"]
+
+
+def _holdings_from_table(df: pd.DataFrame) -> pd.DataFrame:
+    """把任何「持股表」（官網 Excel／CSV／JSON 轉成的表）整理成 股票代號、股票名稱、股數、權重(%)。"""
+    df = df.copy()
+    header = None
+    for i in range(min(len(df), 20)):
+        cells = [str(x) for x in df.iloc[i].tolist()]
+        if any("代號" in c for c in cells) and any(("股數" in c or "持有數" in c or "數量" in c) for c in cells):
+            header = i
+            break
+    if header is not None:
+        df.columns = [str(x).strip() for x in df.iloc[header].tolist()]
+        df = df.iloc[header + 1:]
+    df.columns = [str(c).strip() for c in df.columns]
+
+    def col(*keys):
+        return next((c for c in df.columns if any(k in c for k in keys)), None)
+    c_code, c_name, c_shr, c_w = col("代號"), col("名稱"), col("股數", "持有數", "數量"), col("權重", "比重", "比例")
+    if not c_code or not c_shr:
+        raise RuntimeError(f"持股表欄位對不上，實際欄位：{list(df.columns)[:10]}")
+    out = pd.DataFrame({
+        "股票代號": df[c_code].astype(str).str.strip(),
+        "股票名稱": df[c_name].astype(str).str.strip() if c_name else "",
+        "股數": _to_num(df[c_shr]),
+        "權重(%)": _to_num(df[c_w].astype(str).str.replace("%", "", regex=False)) if c_w else float("nan"),
+    })
+    out = out[out["股票代號"].str.fullmatch(r"[0-9]{4,6}[A-Z]?") & (out["股數"] > 0)]
+    return out.drop_duplicates("股票代號").reset_index(drop=True)
+
+
+def _validate_holdings(df: pd.DataFrame) -> None:
+    if len(df) < 15:
+        raise RuntimeError(f"持股只有 {len(df)} 檔，過少，疑似解析不完整")
+    w = df["權重(%)"].dropna()
+    if len(w) >= len(df) * 0.8 and not 75 <= w.sum() <= 110:
+        raise RuntimeError(f"持股權重合計 {w.sum():.1f}%，不在合理範圍（75～110%），疑似欄位對錯")
+
+
+def _parse_upamc_html(html_text: str) -> Tuple[Optional[dt.date], pd.DataFrame]:
+    """統一投信官網基金頁：持股資料放在 id="DataAsset" 元素的 data-content（HTML 跳脫過的 JSON）。"""
+    m = re.search(r"""id=["']DataAsset["'][^>]*?data-content=["']([^"']*)["']""", html_text) \
+        or re.search(r"""data-content=["']([^"']*)["'][^>]*?id=["']DataAsset["']""", html_text)
+    if not m:
+        ids = re.findall(r"""id=["']([A-Za-z0-9_\-]{3,30})["']""", html_text)[:12]
+        raise RuntimeError(f"頁面中找不到 DataAsset（頁面長度 {len(html_text)}，前幾個 id：{ids}）")
+    data = json.loads(unescape(m.group(1)))
+    rows = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            if ("DetailCode" in o or "StockCode" in o) and ("Share" in o or "Shares" in o):
+                rows.append({"代號": o.get("DetailCode", o.get("StockCode")), "名稱": o.get("DetailName", o.get("StockName", "")),
+                             "股數": o.get("Share", o.get("Shares")), "權重": o.get("NavRate", o.get("Weight"))})
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(data)
+    if not rows:
+        raise RuntimeError("DataAsset 裡沒有找到持股明細（欄位名稱可能改版）")
+    d = None
+    dm = re.search(r"資料日期[^0-9]{0,20}(\d{4}[/-]\d{1,2}[/-]\d{1,2})", html_text)
+    if dm:
+        d = _parse_date(dm.group(1).replace("/", "-"))
+    return d, _holdings_from_table(pd.DataFrame(rows).rename(columns={"代號": "股票代號", "名稱": "股票名稱"}).rename(
+        columns={"股票代號": "代號", "股票名稱": "名稱"}))
+
+
+def _find_upamc_fundcode(code: str) -> Optional[str]:
+    """到官網頁面尋找某檔 ETF 的 fundCode：在連結附近找得到該 ETF 代號就採用。"""
+    for url in UPAMC_DISCOVER_URLS:
+        try:
+            page = _get_text(url, max_attempts=2)
+        except Exception:
+            continue
+        for m in re.finditer(r"fundCode=([0-9A-Za-z]+)", page):
+            ctx = page[max(0, m.start() - 400): m.end() + 400]
+            if code in ctx:
+                return m.group(1)
+    return None
+
+
+def fetch_active_holdings(code: str) -> Tuple[Optional[dt.date], pd.DataFrame]:
+    """依序嘗試：官網基金頁（DataAsset JSON）→ 官網匯出 Excel。全部失敗時，錯誤訊息會列出每一種的失敗原因。"""
+    fund = UPAMC_FUNDCODES.get(code) or _find_upamc_fundcode(code)
+    if not fund:
+        raise RuntimeError("找不到這檔 ETF 在統一投信官網的 fundCode")
+    errs: List[str] = []
+    try:
+        d, df = _parse_upamc_html(_get_text(UPAMC_INFO_URL.format(fund=fund), max_attempts=2))
+        _validate_holdings(df)
+        return d, df
+    except Exception as e:
+        errs.append(f"基金頁：{str(e)[:120]}")
+    try:
+        r = requests.get(UPAMC_EXCEL_URL.format(fund=fund), headers={"User-Agent": "Mozilla/5.0 (tw-stock-dashboard)"}, timeout=(10, 120))
+        r.raise_for_status()
+        df = _holdings_from_table(pd.read_excel(io.BytesIO(r.content), header=None))
+        _validate_holdings(df)
+        return None, df
+    except Exception as e:
+        errs.append(f"Excel：{str(e)[:120]}")
+    raise RuntimeError("；".join(errs))
+
+
+def _manual_holdings(code: str) -> List[Tuple[dt.date, pd.DataFrame]]:
+    """holdings_manual/ 裡手動放的檔案（ETF代號_YYYY-MM-DD.csv／.xlsx）。"""
+    out: List[Tuple[dt.date, pd.DataFrame]] = []
+    if not os.path.isdir(HOLDINGS_MANUAL_DIR):
+        return out
+    for fn in sorted(os.listdir(HOLDINGS_MANUAL_DIR)):
+        m = re.fullmatch(rf"{re.escape(code)}_(\d{{4}}-\d{{2}}-\d{{2}})\.(csv|xlsx)", fn, re.I)
+        if not m:
+            continue
+        path = os.path.join(HOLDINGS_MANUAL_DIR, fn)
+        try:
+            if m.group(2).lower() == "csv":
+                try:
+                    raw = pd.read_csv(path, header=None, dtype=str, encoding="utf-8-sig")
+                except UnicodeDecodeError:
+                    raw = pd.read_csv(path, header=None, dtype=str, encoding="big5")
+            else:
+                raw = pd.read_excel(path, header=None, dtype=str)
+            df = _holdings_from_table(raw)
+            _validate_holdings(df)
+            out.append((dt.date.fromisoformat(m.group(1)), df))
+        except Exception as e:
+            warn(f"主動式 ETF：手動檔案 {fn} 讀取失敗：{str(e)[:120]}")
+    return out
+
+
+def holdings_diff(prev: pd.DataFrame, cur: pd.DataFrame, min_shares: int = HOLDINGS_MIN_SHARES) -> pd.DataFrame:
+    """兩個資料日的持股比較。狀態：新增、剔除、加碼、減碼、不變。"""
+    m = prev.merge(cur, on="股票代號", how="outer", suffixes=("_前", "_後"))
+    rows = []
+    for r in m.to_dict("records"):
+        b, a = r.get("股數_前"), r.get("股數_後")
+        b_ok, a_ok = pd.notna(b), pd.notna(a)
+        before, after = (float(b) if b_ok else 0.0), (float(a) if a_ok else 0.0)
+        delta = after - before
+        if not b_ok:
+            status = "新增"
+        elif not a_ok:
+            status = "剔除"
+        elif abs(delta) < min_shares:
+            status = "不變"
+        else:
+            status = "加碼" if delta > 0 else "減碼"
+        name = r.get("股票名稱_後") if (a_ok and str(r.get("股票名稱_後"))) else r.get("股票名稱_前")
+        rows.append({"股票代號": r["股票代號"], "股票名稱": name, "狀態": status, "前股數": before if b_ok else None, "後股數": after if a_ok else None,
+                     "增減(張)": delta / 1000, "增減(%)": (delta / before * 100) if before else None,
+                     "前權重(%)": r.get("權重(%)_前"), "後權重(%)": r.get("權重(%)_後"),
+                     "權重變化(pp)": (r.get("權重(%)_後") or 0) - (r.get("權重(%)_前") or 0) if (pd.notna(r.get("權重(%)_前")) or pd.notna(r.get("權重(%)_後"))) else None})
+    return pd.DataFrame(rows)
+
+
+def update_active_holdings(output_dir: str, trade_date: dt.date) -> Optional[pd.DataFrame]:
+    """取得主動式 ETF 每日持股 → 累積 → 與前一資料日比較 → 輸出 latest 與 changes。"""
+    path = os.path.join(output_dir, HOLDINGS_FILE)
+    ledger = pd.read_csv(path, dtype={"ETF": str, "股票代號": str}, encoding="utf-8-sig") if os.path.exists(path) else pd.DataFrame(columns=HOLDING_COLS)
+    new_rows = []
+    for code in ACTIVE_CODES:
+        got: List[Tuple[dt.date, pd.DataFrame]] = []
+        try:
+            d, df = fetch_active_holdings(code)
+            got.append((d or trade_date, df))
+        except Exception as e:
+            warn(f"主動式 ETF {code} 持股自動抓取失敗：{str(e)[:300]}")
+        got += _manual_holdings(code)
+        for d, df in got:
+            tmp = df.copy()
+            tmp.insert(0, "ETF", code)
+            tmp.insert(0, "日期", d.isoformat())
+            new_rows.append(tmp[HOLDING_COLS])
+    if new_rows:
+        ledger = pd.concat([ledger] + new_rows, ignore_index=True)
+    if ledger.empty:
+        print("[主動式] 目前沒有任何持股資料（自動抓取失敗，也沒有 holdings_manual/ 手動檔案）")
+        return None
+    ledger = ledger.drop_duplicates(["日期", "ETF", "股票代號"], keep="last")
+    keep = sorted(ledger["日期"].unique())[-HOLDINGS_KEEP_DAYS:]
+    ledger = ledger[ledger["日期"].isin(keep)].sort_values(["日期", "ETF", "股票代號"]).reset_index(drop=True)
+    ledger.to_csv(path, index=False, encoding="utf-8-sig")
+
+    px: Dict[str, Tuple[float, str]] = {}
+    for df in (_QUOTE_CACHE or ()):
+        for r in df[df["日期"] == trade_date].to_dict("records"):
+            px[r["代號"]] = (r["收盤價"], r.get("市場", "TWSE"))
+    latest_rows, change_rows = [], []
+    for code, g in ledger.groupby("ETF"):
+        dates = sorted(g["日期"].unique())
+        cur_d = dates[-1]
+        cur = g[g["日期"] == cur_d][["股票代號", "股票名稱", "股數", "權重(%)"]]
+        prev_d = dates[-2] if len(dates) >= 2 else None
+        diff = holdings_diff(g[g["日期"] == prev_d][["股票代號", "股票名稱", "股數", "權重(%)"]], cur) if prev_d else None
+        status = dict(zip(diff["股票代號"], diff["狀態"])) if diff is not None else {}
+        delta1 = dict(zip(diff["股票代號"], diff["增減(張)"])) if diff is not None else {}
+        first_seen = g.groupby("股票代號")["日期"].min().to_dict()
+
+        def cum(stock, n):                       # 近 n 個資料日的累計增減（張）
+            if len(dates) < 2:
+                return None
+            base_d = dates[max(0, len(dates) - 1 - n)]
+            b = g[(g["日期"] == base_d) & (g["股票代號"] == stock)]["股數"]
+            a = cur[cur["股票代號"] == stock]["股數"]
+            return ((float(a.iloc[0]) if len(a) else 0.0) - (float(b.iloc[0]) if len(b) else 0.0)) / 1000
+        for r in cur.to_dict("records"):
+            s = r["股票代號"]
+            latest_rows.append({"ETF": code, "資料日期": cur_d, "比較日": prev_d or "", "股票代號": s, "股票名稱": r["股票名稱"], "股數": r["股數"],
+                                "權重(%)": r["權重(%)"], "狀態": status.get(s, ""), "較前日增減(張)": delta1.get(s),
+                                "近5日增減(張)": cum(s, 5), "近20日增減(張)": cum(s, 20), "首次出現日": first_seen.get(s, ""),
+                                "參考價": px.get(s, (None, "TWSE"))[0], "市場": px.get(s, (None, "TWSE"))[1]})
+        if diff is not None:
+            for r in diff[diff["狀態"] != "不變"].to_dict("records"):
+                price = px.get(r["股票代號"], (None, "TWSE"))
+                change_rows.append({"資料日期": cur_d, "比較日": prev_d, "ETF": code, "股票代號": r["股票代號"], "股票名稱": r["股票名稱"], "狀態": r["狀態"],
+                                    "前股數": r["前股數"], "後股數": r["後股數"], "增減(張)": r["增減(張)"], "增減(%)": r["增減(%)"],
+                                    "前權重(%)": r["前權重(%)"], "後權重(%)": r["後權重(%)"], "權重變化(pp)": r["權重變化(pp)"],
+                                    "參考價": price[0], "增減金額(萬)": (r["增減(張)"] * 1000 * price[0] / 1e4) if price[0] else None, "市場": price[1]})
+    latest = pd.DataFrame(latest_rows)
+    changes = pd.DataFrame(change_rows, columns=["資料日期", "比較日", "ETF", "股票代號", "股票名稱", "狀態", "前股數", "後股數", "增減(張)", "增減(%)",
+                                                 "前權重(%)", "後權重(%)", "權重變化(pp)", "參考價", "增減金額(萬)", "市場"])
+    for c in ("權重(%)", "較前日增減(張)", "近5日增減(張)", "近20日增減(張)", "參考價"):
+        latest[c] = pd.to_numeric(latest[c], errors="coerce").round(2)
+    for c in ("增減(張)", "增減(%)", "前權重(%)", "後權重(%)", "權重變化(pp)", "參考價", "增減金額(萬)"):
+        changes[c] = pd.to_numeric(changes[c], errors="coerce").round(2)
+    latest.to_csv(os.path.join(output_dir, HOLDINGS_LATEST_FILE), index=False, encoding="utf-8-sig")
+    changes.to_csv(os.path.join(output_dir, HOLDINGS_CHANGES_FILE), index=False, encoding="utf-8-sig")
+    print(f"[主動式] 已輸出持股 {len(latest)} 筆、異動 {len(changes)} 筆（ETF：{sorted(latest['ETF'].unique())}；資料日期：{sorted(latest['資料日期'].unique())}）")
+    return latest
+
+
 def _existing_latest_date(output_dir: str) -> Optional[dt.date]:
     """讀現有 stocks_latest.csv 的最新日期（沒有檔案就回傳 None）。"""
     path = os.path.join(output_dir, "stocks_latest.csv")
@@ -2542,6 +2803,11 @@ def run(output_dir: str = OUTPUT_DIR):
         update_etf(output_dir, trade_date)
     except Exception as e:
         warn(f"ETF 資料更新失敗（股價與族群資料不受影響）：{e}")
+    # ---- 主動式 ETF 專區：每日持股與異動，失敗只警告 ----
+    try:
+        update_active_holdings(output_dir, trade_date)
+    except Exception as e:
+        warn(f"主動式 ETF 持股更新失敗（其他資料不受影響）：{e}")
     # 籌碼流程剛確認的休市日也要從價格歷史排除，再存檔
     hist_final = hist_final[~hist_final["日期"].isin(_closed_dates(output_dir))]
     hist_final.to_csv(hist_path, index=False, encoding="utf-8-sig")
