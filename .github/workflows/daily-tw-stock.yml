@@ -30,10 +30,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: "pip"
@@ -45,6 +45,9 @@ jobs:
 
       - name: Run tracker
         run: python tw_sector_tracker.py
+
+      - name: Build trend and meta files
+        run: python build_extras.py
 
       - name: Commit and push new data
         run: |
