@@ -196,15 +196,18 @@
     </div>
   </section>
 
-  <!-- 主動式 ETF 專區：每日持股與異動（新增／加碼／減碼／剔除）-->
+  <!-- 主動式 ETF 專區：ETF 總覽（由上而下排列）→ 點名稱進入持股明細／今日異動；可搜尋 ETF 或持股 -->
   <section id="aetfView" class="space-y-3 hidden">
-    <div id="aSel" class="flex gap-2 overflow-x-auto pb-1"></div>
-    <div class="flex flex-wrap items-center gap-3 text-xs text-slate-400">
-      <div id="aSub" class="inline-flex rounded-lg bg-slate-800 p-1 text-sm"></div>
-      <span id="aInfo" class="num"></span>
+    <div class="flex flex-wrap items-center gap-2">
+      <input id="aQ" data-aq type="search" autocomplete="off" placeholder="搜尋 ETF 或持股（代號／名稱），例如 00981A、2330、台積電"
+        class="flex-1 min-w-[16rem] bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm placeholder:text-slate-500 focus:outline-none focus:border-sky-500">
+      <button data-aclear class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-sm text-slate-300">清除</button>
     </div>
+    <div id="aNav" class="flex flex-wrap items-center gap-3 text-sm"></div>
     <p id="aHint" class="hidden text-xs text-amber-300/90 leading-relaxed"></p>
-    <div id="a_chg" class="space-y-3"></div>
+    <div id="a_list" class="space-y-2"></div>
+    <div id="a_found" class="space-y-2"></div>
+    <div id="a_chg" class="hidden space-y-3"></div>
     <div id="a_hold" class="hidden space-y-2">
       <div id="aHoldSum" class="text-xs text-slate-400"></div>
       <div class="bg-slate-800/60 rounded-xl overflow-x-auto">
@@ -283,7 +286,7 @@ let savedLots = {};
 try { savedLots = JSON.parse(localStorage.getItem("etfLots") || "{}") || {}; } catch (e) {}
 let savedSite = null;
 try { savedSite = localStorage.getItem("chartSite2"); } catch (e) {}
-const S = { aLatest:null, aChanges:null, asel:null, asub:"chg", etf:null, etfDiv:null, etfFill:null, lots:savedLots, esub:"list", ecat:null, egrp:null, esort:{key:"ttmYield", dir:-1}, chips:null, csort:{key:"main", dir:-1}, period:savedPeriod, data:null, sample:false, view:"overview", filter:null, weighted:false, highlight:null, scrollToHit:false, listFor:null, sort:{key:"pct1d",dir:-1},
+const S = { aLatest:null, aChanges:null, aview:"list", asel:null, asub:"hold", aq:"", etf:null, etfDiv:null, etfFill:null, lots:savedLots, esub:"list", ecat:null, egrp:null, esort:{key:"ttmYield", dir:-1}, chips:null, csort:{key:"main", dir:-1}, period:savedPeriod, data:null, sample:false, view:"overview", filter:null, weighted:false, highlight:null, scrollToHit:false, listFor:null, sort:{key:"pct1d",dir:-1},
   chartSite: CHART_SITES[savedSite] ? savedSite : CONFIG.CHART_SITE };
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -548,6 +551,7 @@ const money = v => Math.round(v).toLocaleString("zh-TW");
 
 document.addEventListener("input", ev => {
   const t = ev.target;
+  if (t && t.dataset && t.dataset.aq !== undefined) { S.aq = t.value || ""; renderAetf(); return; }
   if (t && t.dataset && t.dataset.lots !== undefined) {
     const v = parseFloat(t.value);
     S.lots[t.dataset.lots] = Number.isFinite(v) && v > 0 ? v : 0;
@@ -790,57 +794,104 @@ function renderEtf() {
 
 const A_BUY = ["新增", "加碼"], A_SELL = ["減碼", "剔除"];
 const A_STYLE = { "新增": ["text-rose-300", "bg-rose-500/15"], "加碼": ["text-rose-300", "bg-rose-500/10"], "減碼": ["text-emerald-300", "bg-emerald-500/10"], "剔除": ["text-emerald-300", "bg-emerald-500/15"] };
-const aName = code => { const e = (S.etf || []).find(x => x.code === code); return e ? e.name : ""; };
+const aEtf = code => (S.etf || []).find(x => x.code === code);
+const aName = code => { const e = aEtf(code); return e ? e.name : ""; };
 const aLink = (code, name, market) => `<span class="num text-slate-400">${esc(code)}</span> <a href="${chartUrl(code, market)}" target="_blank" rel="noopener noreferrer" class="font-medium text-sky-300 hover:underline">${esc(name)}</a>`;
 const lotsStr = v => v == null ? "—" : (v > 0 ? "+" : "") + v.toLocaleString("zh-TW", { maximumFractionDigits: 1 }) + " 張";
+const aQuery = () => (S.aq || "").trim().toLowerCase();
+const aMatch = (q, ...vals) => !q || vals.some(v => String(v == null ? "" : v).toLowerCase().includes(q));
+const aStatusBadge = s => A_STYLE[s] ? `<span class="px-1.5 py-0.5 rounded text-[11px] ${A_STYLE[s][1]} ${A_STYLE[s][0]}">${s}</span>` : "";
 
-function renderAetfChanges(etfs) {
-  const box = $("a_chg"), ch = S.aChanges || [];
-  box.innerHTML = etfs.map(code => {
-    const meta = (S.aLatest || []).find(r => r.etf === code) || {};
-    const rows = ch.filter(r => r.etf === code);
-    const title = `<div class="flex flex-wrap items-baseline gap-x-3"><span class="font-semibold">${esc(code)} ${esc(aName(code))}</span>
-      <span class="num text-xs text-slate-400">${meta.prevDate ? `${esc(meta.date)} 對照 ${esc(meta.prevDate)}` : `資料日 ${esc(meta.date || "")}`}</span></div>`;
-    if (!meta.prevDate) return `<div class="bg-slate-800/60 rounded-xl p-3 space-y-2">${title}<div class="text-sm text-slate-500">目前只有一個資料日，還沒有前一日可以比較；明天更新後就會出現異動。</div></div>`;
-    const counts = ["新增", "加碼", "減碼", "剔除"].map(s => `<span class="px-2 py-0.5 rounded ${A_STYLE[s][1]} ${A_STYLE[s][0]} text-xs">${s} ${rows.filter(r => r.status === s).length}</span>`).join(" ");
-    if (!rows.length) return `<div class="bg-slate-800/60 rounded-xl p-3 space-y-2">${title}<div class="text-sm text-slate-400">這個資料日沒有異動。</div></div>`;
-    const group = s => {
-      const items = rows.filter(r => r.status === s).sort((a, b) => Math.abs(b.amt || 0) - Math.abs(a.amt || 0) || Math.abs(b.lots || 0) - Math.abs(a.lots || 0));
-      return `<div><div class="text-xs mb-1 ${A_STYLE[s][0]}">${s}（${items.length}）</div>${items.map(r => `<div class="flex items-baseline justify-between gap-2 py-0.5 text-xs">
-        <span class="truncate">${aLink(r.code, r.name, r.market)}</span>
-        <span class="num whitespace-nowrap text-right ${A_STYLE[s][0]}">${lotsStr(r.lots)}${r.amt != null ? `<span class="text-slate-500"> ≈ ${Math.abs(r.amt).toLocaleString("zh-TW", { maximumFractionDigits: 0 })} 萬</span>` : ""}
-        <span class="text-slate-500">｜權重 ${r.wBefore == null ? "—" : r.wBefore.toFixed(2)}→${r.wAfter == null ? "—" : r.wAfter.toFixed(2)}%</span></span></div>`).join("") || `<div class="text-xs text-slate-600">—</div>`}</div>`;
-    };
-    return `<div class="bg-slate-800/60 rounded-xl p-3 space-y-2">${title}<div class="flex flex-wrap gap-2">${counts}</div>
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-x-6 gap-y-3">${["新增", "加碼", "減碼", "剔除"].map(group).join("")}</div></div>`;
-  }).join("") || "";
+function aEtfInfo(code) {
+  const rows = (S.aLatest || []).filter(r => r.etf === code).sort((a, b) => (b.weight || 0) - (a.weight || 0));
+  const ch = (S.aChanges || []).filter(r => r.etf === code);
+  return { code, name: aName(code), rows, date: rows.length ? rows[0].date : "", prevDate: rows.length ? rows[0].prevDate : "", n: rows.length,
+    top10: rows.slice(0, 10).reduce((s, r) => s + (r.weight || 0), 0), counts: Object.fromEntries(["新增", "加碼", "減碼", "剔除"].map(s => [s, ch.filter(r => r.status === s).length])) };
 }
 
-function renderAetfHold(etfs) {
-  const rows = (S.aLatest || []).filter(r => etfs.includes(r.etf)).sort((a, b) => (b.weight || 0) - (a.weight || 0));
-  const multi = etfs.length > 1;
-  $("ahhead").innerHTML = [multi ? "ETF" : null, "股票", "權重", "股數(張)", "較前日", "近 5 日", "近 20 日", "首次出現", "狀態"].filter(Boolean)
-    .map((t, i) => `<th class="${(multi ? i === 1 : i === 0) ? "sticky-col text-left" : "text-right"} px-3 py-2 font-medium whitespace-nowrap">${t}</th>`).join("");
-  const maxW = Math.max(0, ...rows.map(r => r.weight || 0));
-  const sum = etfs.map(code => { const rs = (S.aLatest || []).filter(r => r.etf === code).sort((a, b) => (b.weight || 0) - (a.weight || 0));
-    return `${esc(code)}：${rs.length} 檔，前 10 大合計 ${rs.slice(0, 10).reduce((s, r) => s + (r.weight || 0), 0).toFixed(1)}%`; }).join("　｜　");
-  $("aHoldSum").textContent = ""; $("aHoldSum").innerHTML = sum;
+function renderAetfList(q) {
+  const codes = [...new Set((S.aLatest || []).map(r => r.etf))];
+  const infos = codes.map(aEtfInfo).sort((a, b) => ((aEtf(b.code) || {}).aum || 0) - ((aEtf(a.code) || {}).aum || 0) || a.code.localeCompare(b.code))
+    .filter(i => aMatch(q, i.code, i.name));
+  $("a_list").innerHTML = infos.map(i => {
+    const m = aEtf(i.code) || {};
+    const badges = i.prevDate ? ["新增", "加碼", "減碼", "剔除"].map(s => `<span class="px-2 py-0.5 rounded text-xs ${A_STYLE[s][1]} ${A_STYLE[s][0]}">${s} ${i.counts[s]}</span>`).join(" ")
+      : `<span class="text-xs text-slate-500">尚無前一日可比較</span>`;
+    return `<div class="bg-slate-800/60 hover:bg-slate-800 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-x-6 gap-y-2">
+      <div class="min-w-[16rem]">
+        <button data-aopen="${esc(i.code)}" class="text-left"><span class="num text-slate-400">${esc(i.code)}</span> <span class="font-semibold text-sky-300 hover:underline">${esc(i.name || i.code)}</span> <span class="text-slate-500">›</span></button>
+        <div class="num text-xs text-slate-400 mt-0.5">持股資料日 ${esc(i.date)}${i.prevDate ? `（對照 ${esc(i.prevDate)}）` : ""}｜${i.n} 檔｜前 10 大合計 ${i.top10.toFixed(1)}%</div>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">${badges}</div>
+      <div class="num text-xs text-slate-300 flex flex-wrap gap-x-4">
+        <span>規模 ${m.aum == null ? "—" : m.aum.toLocaleString("zh-TW", { maximumFractionDigits: 0 }) + " 億"}</span>
+        <span>折溢價 ${m.prem == null ? "—" : (m.prem > 0 ? "+" : "") + m.prem.toFixed(2) + "%"}</span>
+        <span>年報酬(含息) ${m.ret1y == null ? "—" : (m.ret1y > 0 ? "+" : "") + m.ret1y.toFixed(1) + "%"}</span>
+      </div>
+      <button data-aopen="${esc(i.code)}" class="px-3 py-1 rounded-lg bg-sky-600/80 hover:bg-sky-600 text-xs">持股明細</button></div>`;
+  }).join("") || (q ? "" : `<div class="px-3 py-6 text-center text-slate-500 bg-slate-800/60 rounded-xl">沒有資料</div>`);
+  return infos.length;
+}
+
+function renderAetfFound(q) {
+  const box = $("a_found");
+  if (!q) { box.innerHTML = ""; return 0; }
+  const rows = (S.aLatest || []).filter(r => aMatch(q, r.code, r.name)).sort((a, b) => (b.weight || 0) - (a.weight || 0)).slice(0, 200);
+  if (!rows.length) { box.innerHTML = ""; return 0; }
+  const delta = v => v == null ? `<span class="text-slate-600">—</span>` : `<span class="${col(v)}">${v > 0 ? "+" : ""}${v.toLocaleString("zh-TW", { maximumFractionDigits: 1 })}</span>`;
+  box.innerHTML = `<div class="text-xs text-slate-400 pt-1">持股搜尋結果：「${esc(S.aq.trim())}」共 ${rows.length} 筆${rows.length === 200 ? "（僅顯示前 200 筆）" : ""}</div>` + (rows.length ? `
+    <div class="bg-slate-800/60 rounded-xl overflow-x-auto"><table class="w-full min-w-[760px] text-sm">
+      <thead class="text-slate-400 text-xs"><tr>${["股票", "ETF", "權重", "股數(張)", "較前日", "狀態"].map((t, i) => `<th class="${i === 0 ? "text-left" : i === 1 ? "text-left" : "text-right"} px-3 py-2 font-medium whitespace-nowrap">${t}</th>`).join("")}</tr></thead>
+      <tbody class="divide-y divide-slate-700/50">${rows.map(r => `<tr class="hover:bg-slate-700/30">
+        <td class="px-3 py-2 whitespace-nowrap">${aLink(r.code, r.name, r.market)}</td>
+        <td class="px-3 py-2 whitespace-nowrap"><button data-aopen="${esc(r.etf)}" class="text-sky-300 hover:underline"><span class="num">${esc(r.etf)}</span> ${esc(aName(r.etf))}</button></td>
+        <td class="num text-right px-3 py-2">${r.weight == null ? "—" : r.weight.toFixed(2) + "%"}</td>
+        <td class="num text-right px-3 py-2">${r.shares == null ? "—" : (r.shares / 1000).toLocaleString("zh-TW", { maximumFractionDigits: 1 })}</td>
+        <td class="num text-right px-3 py-2">${delta(r.d1)}</td>
+        <td class="text-right px-3 py-2">${aStatusBadge(r.status)}</td></tr>`).join("")}</tbody></table></div>` : "");
+  return rows.length;
+}
+
+function renderAetfHold(code, q) {
+  const all = (S.aLatest || []).filter(r => r.etf === code).sort((a, b) => (b.weight || 0) - (a.weight || 0));
+  const rows = all.filter(r => aMatch(q, r.code, r.name));
+  $("ahhead").innerHTML = ["股票", "權重", "股數(張)", "較前日", "近 5 日", "近 20 日", "首次出現", "狀態"]
+    .map((t, i) => `<th class="${i === 0 ? "sticky-col text-left" : "text-right"} px-3 py-2 font-medium whitespace-nowrap">${t}</th>`).join("");
+  const maxW = Math.max(0, ...all.map(r => r.weight || 0));
+  $("aHoldSum").innerHTML = `${all.length} 檔，前 10 大合計 ${all.slice(0, 10).reduce((s, r) => s + (r.weight || 0), 0).toFixed(1)}%${q ? `｜符合搜尋的 ${rows.length} 檔` : ""}`;
   const delta = v => v == null ? `<span class="text-slate-600">—</span>` : `<span class="${col(v)}">${v > 0 ? "+" : ""}${v.toLocaleString("zh-TW", { maximumFractionDigits: 1 })}</span>`;
   $("ahbody").innerHTML = rows.map(r => `<tr class="hover:bg-slate-700/30">
-    ${multi ? `<td class="num px-3 py-2 text-slate-400">${esc(r.etf)}</td>` : ""}
-    <td class="${multi ? "" : "sticky-col "}px-3 py-2 whitespace-nowrap">${aLink(r.code, r.name, r.market)}</td>
+    <td class="sticky-col px-3 py-2 whitespace-nowrap">${aLink(r.code, r.name, r.market)}</td>
     <td class="num text-right px-3 py-2"><div class="flex items-center justify-end gap-2"><div class="w-20 h-2 bg-slate-700 rounded"><div class="h-2 rounded bg-sky-500" style="width:${maxW ? (r.weight || 0) / maxW * 100 : 0}%"></div></div>${r.weight == null ? "—" : r.weight.toFixed(2) + "%"}</div></td>
     <td class="num text-right px-3 py-2">${r.shares == null ? "—" : (r.shares / 1000).toLocaleString("zh-TW", { maximumFractionDigits: 1 })}</td>
     <td class="num text-right px-3 py-2">${delta(r.d1)}</td><td class="num text-right px-3 py-2">${delta(r.d5)}</td><td class="num text-right px-3 py-2">${delta(r.d20)}</td>
     <td class="num text-right px-3 py-2 text-slate-400">${r.first ? mdStr(r.first) : "—"}</td>
-    <td class="text-right px-3 py-2 whitespace-nowrap">${A_STYLE[r.status] ? `<span class="px-1.5 py-0.5 rounded text-[11px] ${A_STYLE[r.status][1]} ${A_STYLE[r.status][0]}">${r.status}</span>` : ""}</td></tr>`).join("")
-    || `<tr><td colspan="${multi ? 9 : 8}" class="px-3 py-6 text-center text-slate-500">沒有資料</td></tr>`;
+    <td class="text-right px-3 py-2 whitespace-nowrap">${aStatusBadge(r.status)}</td></tr>`).join("")
+    || `<tr><td colspan="8" class="px-3 py-6 text-center text-slate-500">沒有符合的持股</td></tr>`;
 }
 
-function renderAetfCross(etfs) {
+function renderAetfChanges(code, q) {
+  const meta = (S.aLatest || []).find(r => r.etf === code) || {};
+  const rows = (S.aChanges || []).filter(r => r.etf === code && aMatch(q, r.code, r.name));
+  const counts = ["新增", "加碼", "減碼", "剔除"].map(s => `<span class="px-2 py-0.5 rounded ${A_STYLE[s][1]} ${A_STYLE[s][0]} text-xs">${s} ${rows.filter(r => r.status === s).length}</span>`).join(" ");
+  const info = `<div class="num text-xs text-slate-400">${meta.prevDate ? `${esc(meta.date)} 對照 ${esc(meta.prevDate)}` : `資料日 ${esc(meta.date || "")}`}</div>`;
+  if (!meta.prevDate) { $("a_chg").innerHTML = `<div class="bg-slate-800/60 rounded-xl p-3 space-y-2">${info}<div class="text-sm text-slate-500">目前只有一個資料日，還沒有前一日可以比較；明天更新後就會出現異動。</div></div>`; return; }
+  if (!rows.length) { $("a_chg").innerHTML = `<div class="bg-slate-800/60 rounded-xl p-3 space-y-2">${info}<div class="text-sm text-slate-400">${q ? "沒有符合搜尋的異動。" : "這個資料日沒有異動。"}</div></div>`; return; }
+  const group = s => {
+    const items = rows.filter(r => r.status === s).sort((a, b) => Math.abs(b.amt || 0) - Math.abs(a.amt || 0) || Math.abs(b.lots || 0) - Math.abs(a.lots || 0));
+    return `<div><div class="text-xs mb-1 ${A_STYLE[s][0]}">${s}（${items.length}）</div>${items.map(r => `<div class="flex items-baseline justify-between gap-2 py-0.5 text-xs">
+      <span class="truncate">${aLink(r.code, r.name, r.market)}</span>
+      <span class="num whitespace-nowrap text-right ${A_STYLE[s][0]}">${lotsStr(r.lots)}${r.amt != null ? `<span class="text-slate-500"> ≈ ${Math.abs(r.amt).toLocaleString("zh-TW", { maximumFractionDigits: 0 })} 萬</span>` : ""}
+      <span class="text-slate-500">｜權重 ${r.wBefore == null ? "—" : r.wBefore.toFixed(2)}→${r.wAfter == null ? "—" : r.wAfter.toFixed(2)}%</span></span></div>`).join("") || `<div class="text-xs text-slate-600">—</div>`}</div>`;
+  };
+  $("a_chg").innerHTML = `<div class="bg-slate-800/60 rounded-xl p-3 space-y-2">${info}<div class="flex flex-wrap gap-2">${counts}</div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-x-6 gap-y-3">${["新增", "加碼", "減碼", "剔除"].map(group).join("")}</div></div>`;
+}
+
+function renderAetfCross(q) {
   $("achead").innerHTML = ["股票", "訊號", "買進 ETF 數", "賣出 ETF 數", "合計增減", "各 ETF 明細"].map((t, i) => `<th class="${i === 0 ? "sticky-col text-left" : i === 5 ? "text-left" : "text-right"} px-3 py-2 font-medium whitespace-nowrap">${t}</th>`).join("");
   const by = new Map();
-  (S.aChanges || []).filter(r => etfs.includes(r.etf)).forEach(r => { if (!by.has(r.code)) by.set(r.code, { code: r.code, name: r.name, market: r.market, items: [] }); by.get(r.code).items.push(r); });
+  (S.aChanges || []).filter(r => aMatch(q, r.code, r.name)).forEach(r => { if (!by.has(r.code)) by.set(r.code, { code: r.code, name: r.name, market: r.market, items: [] }); by.get(r.code).items.push(r); });
   const rows = [...by.values()].map(s => {
     const buy = s.items.filter(i => A_BUY.includes(i.status)), sell = s.items.filter(i => A_SELL.includes(i.status));
     return { ...s, nb: buy.length, ns: sell.length, net: s.items.reduce((t, i) => t + (i.lots || 0), 0),
@@ -857,25 +908,39 @@ function renderAetfCross(etfs) {
 }
 
 function renderAetf() {
-  const latest = S.aLatest || [];
-  const etfs = [...new Set(latest.map(r => r.etf))];
-  const sel = S.asel && etfs.includes(S.asel) ? S.asel : null;
-  $("aSel").innerHTML = [null, ...etfs].map(c => `<button data-asel="${c === null ? "" : esc(c)}" class="chip shrink-0 px-3 py-1 rounded-full text-sm ${sel === c ? "bg-sky-600" : "bg-slate-800 hover:bg-slate-700"}">${c === null ? "全部" : esc(c) + " " + esc(aName(c))}</button>`).join("");
-  $("aSub").innerHTML = [["chg", "今日異動"], ["hold", "持股明細"], ["cross", "同買同賣"]].map(([k, t]) => `<button data-asub="${k}" class="px-3 py-1 rounded-md ${S.asub === k ? "bg-sky-600" : "text-slate-300"}">${t}</button>`).join("");
-  ["chg", "hold", "cross"].forEach(k => $("a_" + k).classList.toggle("hidden", S.asub !== k));
-  const hint = $("aHint");
+  const latest = S.aLatest || [], q = aQuery(), hint = $("aHint");
+  const show = (id, on) => $(id).classList.toggle("hidden", !on);
+  const inDetail = S.aview === "detail" && latest.some(r => r.etf === S.asel);
+  if (!inDetail && S.aview === "detail") S.aview = "list";
+  const navBtn = (attr, val, text, active) => `<button ${attr}="${val}" class="px-3 py-1 rounded-md ${active ? "bg-sky-600" : "bg-slate-800 text-slate-300 hover:bg-slate-700"}">${text}</button>`;
   if (!latest.length) {
-    $("aInfo").textContent = "";
+    $("aNav").innerHTML = "";
     hint.innerHTML = "尚無主動式 ETF 持股資料：腳本還沒有成功取得每日持股（自動抓取失敗時，GitHub Actions 的黃色警告會寫出原因）。<br>備援做法：把統一投信官網下載的持股 Excel 或 CSV，放進 repo 的 <b>holdings_manual/</b> 資料夾，檔名用「ETF代號_日期.xlsx」，例如 <b>00981A_2026-11-09.xlsx</b>，下一次更新就會讀進來；連續兩天以上就會出現異動。";
     hint.classList.remove("hidden");
-    $("a_chg").innerHTML = ""; $("ahbody").innerHTML = ""; $("acbody").innerHTML = ""; $("aHoldSum").innerHTML = "";
+    ["a_list", "a_found", "a_chg", "a_hold", "a_cross"].forEach(id => { show(id, false); });
     return;
   }
   hint.classList.add("hidden");
-  const dates = [...new Set(latest.filter(r => !sel || r.etf === sel).map(r => r.date))];
-  $("aInfo").textContent = "持股資料日 " + dates.join("、");
-  const list = sel ? [sel] : etfs;
-  if (S.asub === "hold") renderAetfHold(list); else if (S.asub === "cross") renderAetfCross(list); else renderAetfChanges(list);
+  if (inDetail) {
+    const i = aEtfInfo(S.asel);
+    $("aNav").innerHTML = `<button data-aback class="px-3 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300">← 返回列表</button>
+      <span class="font-semibold"><span class="num text-slate-400">${esc(i.code)}</span> ${esc(i.name)}</span>
+      <span class="num text-xs text-slate-400">持股資料日 ${esc(i.date)}</span>
+      <span class="inline-flex gap-1 ml-auto">${navBtn("data-asub", "hold", "持股明細", S.asub === "hold")}${navBtn("data-asub", "chg", "今日異動", S.asub === "chg")}</span>`;
+    show("a_list", false); show("a_found", false); show("a_cross", false);
+    show("a_hold", S.asub === "hold"); show("a_chg", S.asub === "chg");
+    if (S.asub === "chg") renderAetfChanges(S.asel, q); else renderAetfHold(S.asel, q);
+    return;
+  }
+  $("aNav").innerHTML = navBtn("data-aview", "list", "ETF 總覽", S.aview === "list") + navBtn("data-aview", "cross", "同買同賣", S.aview === "cross")
+    + `<span class="num text-xs text-slate-400">${[...new Set(latest.map(r => r.date))].map(d => "持股資料日 " + d).join("、")}</span>`;
+  show("a_hold", false); show("a_chg", false);
+  show("a_list", S.aview === "list"); show("a_found", S.aview === "list"); show("a_cross", S.aview === "cross");
+  if (S.aview === "cross") renderAetfCross(q);
+  else {
+    const nEtf = renderAetfList(q), nStock = renderAetfFound(q);
+    if (q && !nEtf && !nStock) $("a_list").innerHTML = `<div class="px-3 py-6 text-center text-slate-500 bg-slate-800/60 rounded-xl">沒有符合的 ETF 或持股</div>`;
+  }
 }
 
 function render() {
@@ -903,7 +968,7 @@ function pick(name) { S.filter = name || null; S.highlight = null; $("q").value 
 
 /* ===== 事件 ===== */
 document.addEventListener("click", e => {
-  const t = e.target.closest("[data-view],[data-w],[data-sector],[data-chip],[data-sort],[data-clear],[data-p],[data-csort],[data-ecat],[data-egrp],[data-esort],[data-esub],[data-qapply],[data-qclear],[data-asel],[data-asub]"); if (!t) return;
+  const t = e.target.closest("[data-view],[data-w],[data-sector],[data-chip],[data-sort],[data-clear],[data-p],[data-csort],[data-ecat],[data-egrp],[data-esort],[data-esub],[data-qapply],[data-qclear],[data-aopen],[data-aview],[data-asub],[data-aback],[data-aclear]"); if (!t) return;
   if (t.dataset.view) { S.view = t.dataset.view; render(); }
   else if (t.dataset.w) { S.weighted = t.dataset.w === "1"; render(); }
   else if (t.dataset.sector) pick(t.dataset.sector);
@@ -912,7 +977,15 @@ document.addEventListener("click", e => {
   else if (t.dataset.p) { S.period = +t.dataset.p; try { localStorage.setItem("chipPeriod", S.period); } catch (err) {} renderChips(); }
   else if (t.dataset.ecat !== undefined) { S.ecat = t.dataset.ecat === "" ? null : t.dataset.ecat; renderEtf(); }
   else if (t.dataset.egrp !== undefined) { S.egrp = t.dataset.egrp === "" ? null : t.dataset.egrp; renderEtf(); }
-  else if (t.dataset.asel !== undefined) { S.asel = t.dataset.asel === "" ? null : t.dataset.asel; renderAetf(); }
+  else if (t.dataset.aopen) {
+    const code = t.dataset.aopen, q = aQuery();
+    S.aview = "detail"; S.asel = code; S.asub = "hold";
+    if (aMatch(q, code, aName(code))) { S.aq = ""; $("aQ").value = ""; }      // 搜尋的是這檔 ETF 本身 → 清掉；搜尋的是股票 → 保留，直接看該股票
+    renderAetf(); window.scrollTo(0, 0);
+  }
+  else if (t.dataset.aview) { S.aview = t.dataset.aview; renderAetf(); }
+  else if (t.dataset.aback !== undefined) { S.aview = "list"; renderAetf(); window.scrollTo(0, 0); }
+  else if (t.dataset.aclear !== undefined) { S.aq = ""; $("aQ").value = ""; renderAetf(); }
   else if (t.dataset.asub) { S.asub = t.dataset.asub; renderAetf(); }
   else if (t.dataset.qapply !== undefined) {
     const amt = parseFloat($("qAmt").value);
